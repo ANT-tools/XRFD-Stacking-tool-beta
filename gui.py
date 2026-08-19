@@ -32,11 +32,12 @@ from .processing import (
 from .analysis import extract_meridian_equator, find_profile_peaks
 from .stacking import StackSettings, build_stack, preflight_stack_shapes
 from .symmetry import SymmetrySettings, build_symmetry_average
+from .provenance import utc_timestamp, sha256_file, write_provenance_bundle
 from .backend import get_gpu_info, resolve_backend
 from .axis_detection import AxisDetectionSettings, detect_beam_center_and_fiber_axis
 
 
-APP_TITLE = "XRD Image Toolkit 0.6.0"
+APP_TITLE = "XRD Image Toolkit 0.6.1"
 
 
 class XRDToolkitApp(tk.Tk):
@@ -50,6 +51,7 @@ class XRDToolkitApp(tk.Tk):
         # ---------------- Data state ----------------
         self.current_path = None
         self.current_label = None
+        self.current_source_kind = None
 
         self.raw = None
         self.dark = None
@@ -205,6 +207,12 @@ class XRDToolkitApp(tk.Tk):
         self.png_include_axes = tk.BooleanVar(value=True)
         self.png_include_title = tk.BooleanVar(value=True)
         self.png_dpi = tk.IntVar(value=180)
+
+        # Provenance / detector-coordinate export metadata
+        self.provenance_auto_sidecars = tk.BooleanVar(value=True)
+        self.provenance_calibration_label = tk.StringVar(value="MD-033")
+        self.provenance_expected_rows = tk.IntVar(value=3072)
+        self.provenance_expected_columns = tk.IntVar(value=3072)
 
         self.status_var = tk.StringVar(value="Ready.")
         self.stack_summary_var = tk.StringVar(value="No stack has been built.")
@@ -1505,6 +1513,54 @@ class XRDToolkitApp(tk.Tk):
             command=self.save_metadata,
         ).pack(fill=tk.X, padx=6, pady=4)
 
+        provenance = self._section(
+            self.tab_export,
+            "Provenance / detector-coordinate record",
+        )
+
+        ttk.Checkbutton(
+            provenance,
+            text="Write JSON + annotated TXT sidecars with corrected TIFF",
+            variable=self.provenance_auto_sidecars,
+        ).pack(anchor="w", padx=6, pady=3)
+
+        self._entry_row(
+            provenance,
+            "Geometry calibration label",
+            self.provenance_calibration_label,
+            width=16,
+        )
+
+        self._entry_row(
+            provenance,
+            "Expected detector rows",
+            self.provenance_expected_rows,
+        )
+
+        self._entry_row(
+            provenance,
+            "Expected detector columns",
+            self.provenance_expected_columns,
+        )
+
+        ttk.Button(
+            provenance,
+            text="Save provenance bundle (JSON + TXT)…",
+            command=self.save_provenance_bundle,
+        ).pack(fill=tk.X, padx=6, pady=4)
+
+        ttk.Label(
+            provenance,
+            text=(
+                "The JSON is the canonical machine record. The TXT contains the same "
+                "typed values plus explanatory comments and can be parsed back by the "
+                "toolkit. The calibration label records intended use; it does not by "
+                "itself verify the contents of a PONI file."
+            ),
+            wraplength=370,
+            justify=tk.LEFT,
+        ).pack(fill=tk.X, padx=6, pady=5)
+
         symmetry = self._section(
             self.tab_export,
             "Symmetry products",
@@ -1889,6 +1945,7 @@ class XRDToolkitApp(tk.Tk):
 
             self.current_path = Path(path)
             self.current_label = self.current_path.name
+            self.current_source_kind = "tiff"
             self.raw = image
             self.processing_engine.reset()
 
@@ -2196,6 +2253,7 @@ class XRDToolkitApp(tk.Tk):
         self.processing_engine.reset()
 
         self.current_path = None
+        self.current_source_kind = "stack"
         self.current_label = (
             f"STACK ({len(self.stack_result.frame_stats)} frames, "
             f"{self.stack_result.settings.method})"
@@ -3476,6 +3534,301 @@ class XRDToolkitApp(tk.Tk):
 
         return "xrd_image"
 
+    def _current_corrected_is_from_stack(self):
+        return (
+            self.current_source_kind == "stack"
+            and self.stack_result is not None
+        )
+
+    def _detector_geometry_flags(self):
+        stack_used = self._current_corrected_is_from_stack()
+        registration_applied = bool(
+            stack_used
+            and getattr(self.stack_result.settings, "align", False)
+        )
+
+        # The corrected working image itself is never rotated/flipped/cropped/
+        # interpolated/symmetry-folded by the processing pipeline. Temporal
+        # registration is the one spatial exception because aligned stack
+        # frames are shifted before combination.
+        rotation_applied = False
+        flip_applied = False
+        crop_applied = False
+        interpolation_applied = False
+        symmetry_transform_applied = False
+
+        detector_native = not any([
+            rotation_applied,
+            flip_applied,
+            crop_applied,
+            interpolation_applied,
+            registration_applied,
+            symmetry_transform_applied,
+        ])
+
+        return {
+            "rotation_applied": rotation_applied,
+            "flip_applied": flip_applied,
+            "crop_applied": crop_applied,
+            "interpolation_applied": interpolation_applied,
+            "registration_applied": registration_applied,
+            "symmetry_transform_applied": symmetry_transform_applied,
+            "detector_native_orientation": detector_native,
+        }
+
+    def _corrected_provenance_payload(self, output_file=None):
+        if self.results is None:
+            raise ValueError("No corrected working image is available.")
+
+        corrected = np.asarray(self.results["corrected"])
+        settings = self.get_processing_settings()
+        geometry = self._detector_geometry_flags()
+
+        rows, columns = map(int, corrected.shape)
+
+        expected_rows = int(self.provenance_expected_rows.get())
+        expected_columns = int(self.provenance_expected_columns.get())
+
+        shape_matches = (
+            rows == expected_rows
+            and columns == expected_columns
+        )
+
+        safe_for_poni = bool(
+            shape_matches
+            and geometry["detector_native_orientation"]
+        )
+
+        stack_used = self._current_corrected_is_from_stack()
+
+        if stack_used:
+            frame_paths = [
+                stat.path
+                for stat in self.stack_result.frame_stats
+            ]
+            stack_method = self.stack_result.settings.method
+            frame_count = len(self.stack_result.frame_stats)
+            stack_summary = self.stack_result.summary()
+            approx_snr = stack_summary.get(
+                "approximate_snr_gain_vs_one_frame"
+            )
+        else:
+            frame_paths = []
+            stack_method = None
+            frame_count = 1 if self.current_source_kind == "tiff" else None
+            approx_snr = None
+
+        mask = np.asarray(self.results["mask"], dtype=bool)
+        masked_count = int(np.count_nonzero(mask))
+
+        output_path = Path(output_file) if output_file else None
+        output_hash = (
+            sha256_file(output_path)
+            if output_path is not None and output_path.exists()
+            else None
+        )
+
+        calibration_label = self.provenance_calibration_label.get().strip()
+
+        compatibility_note = (
+            "This detector-coordinate product is intended for the named calibration "
+            "only if that PONI/geometry file was calibrated against the same native "
+            "detector row/column orientation, detector dimensions, pixel size, and "
+            "detector geometry. Recording the label does not verify the PONI contents."
+        )
+
+        if safe_for_poni:
+            compatibility_status = "intended_unverified"
+        else:
+            compatibility_status = "geometry_not_native_or_shape_mismatch"
+
+        return {
+            "provenance": {
+                "schema_name": "xrd_image_toolkit_provenance",
+                "schema_version": "1.0",
+                "generated_utc": utc_timestamp(),
+                "toolkit": APP_TITLE,
+            },
+            "product": {
+                "product_type": "corrected_detector_coordinate_image",
+                "output_file": str(output_path) if output_path else None,
+                "output_file_sha256": output_hash,
+                "array_rows": rows,
+                "array_columns": columns,
+                "array_dtype_in_memory": str(corrected.dtype),
+                "exported_tiff_dtype": "float32",
+                "source_kind": self.current_source_kind,
+                "source_file": (
+                    str(self.current_path)
+                    if self.current_path is not None
+                    else None
+                ),
+                "source_label": self.current_label,
+            },
+            "coordinate_system": {
+                "coordinate_system": (
+                    "detector_native"
+                    if geometry["detector_native_orientation"]
+                    else "detector_modified"
+                ),
+                "axis_0": "detector_row",
+                "axis_1": "detector_column",
+                "array_origin": "upper_left",
+                **geometry,
+            },
+            "intensity_processing": {
+                "dark_subtraction_applied": bool(settings.dark_enabled),
+                "flat_field_applied": bool(settings.flat_enabled),
+                "background_subtraction_applied": bool(
+                    settings.background_enabled
+                ),
+                "background_scale": float(settings.background_scale),
+                "monitor_normalization_applied": bool(
+                    settings.normalize_enabled
+                ),
+                "monitor_value": float(settings.monitor_value),
+                "hot_pixel_mask_applied": bool(
+                    settings.hot_pixels_enabled
+                ),
+                "saturation_mask_applied": bool(
+                    settings.saturation_enabled
+                ),
+                "beamstop_mask_applied": bool(
+                    settings.beamstop_enabled
+                ),
+                "masked_pixel_count": masked_count,
+                "enhancement_filter_applied": False,
+                "display_transform_applied": False,
+                "display_intensity_rescaling_applied": False,
+                "custom_tone_curve_applied": False,
+            },
+            "stacking": {
+                "temporal_stack_used": bool(stack_used),
+                "stack_method": stack_method,
+                "frame_count": frame_count,
+                "registration_enabled": bool(
+                    geometry["registration_applied"]
+                ),
+                "input_files": frame_paths,
+                "approximate_ideal_snr_gain": approx_snr,
+            },
+            "reference_frames": {
+                "dark_file": (
+                    str(self.dark_path)
+                    if self.dark_path
+                    else None
+                ),
+                "flat_file": (
+                    str(self.flat_path)
+                    if self.flat_path
+                    else None
+                ),
+                "background_file": (
+                    str(self.background_path)
+                    if self.background_path
+                    else None
+                ),
+            },
+            "fiber_geometry": {
+                "beam_center_x_px": float(self.center_x.get()),
+                "beam_center_y_px": float(self.center_y.get()),
+                "fiber_angle_deg_from_positive_x": float(
+                    self.fiber_angle.get()
+                ),
+                "strip_width_px": int(self.strip_width.get()),
+            },
+            "calibration": {
+                "intended_geometry_calibration": (
+                    calibration_label or None
+                ),
+                "compatibility_status": compatibility_status,
+                "expected_detector_rows": expected_rows,
+                "expected_detector_columns": expected_columns,
+                "shape_matches_expected_detector": bool(shape_matches),
+                "safe_detector_geometry_for_existing_poni": bool(
+                    safe_for_poni
+                ),
+                "compatibility_note": compatibility_note,
+            },
+            "tiff_header": {
+                "original_tiff_header_preserved": False,
+                "export_header_generated_by_tifffile": True,
+                "analysis_implication": (
+                    "The toolkit writes a new TIFF container and does not copy "
+                    "the original acquisition header/tags verbatim. Retain the "
+                    "original TIFFs and this provenance record for acquisition "
+                    "metadata needed in later analysis."
+                ),
+            },
+            "analysis_guidance": {
+                "recommended_for_poni_geometry": bool(safe_for_poni),
+                "recommended_for_quantitative_integration": True,
+                "use_symmetrized_product_with_original_poni": False,
+                "use_png_for_quantitative_analysis": False,
+                "note": (
+                    "Use the corrected detector-coordinate TIFF for calibrated "
+                    "integration/model comparison when the recorded geometry checks "
+                    "are satisfied. Display PNGs and symmetrized products serve "
+                    "different purposes and should not be substituted for this array."
+                ),
+            },
+        }
+
+    def _write_corrected_provenance_sidecars(self, corrected_tiff_path):
+        corrected_tiff_path = Path(corrected_tiff_path)
+        sidecar_stem = corrected_tiff_path.with_suffix("")
+        sidecar_stem = sidecar_stem.with_name(
+            sidecar_stem.name + ".provenance"
+        )
+
+        payload = self._corrected_provenance_payload(
+            output_file=corrected_tiff_path
+        )
+
+        return write_provenance_bundle(
+            sidecar_stem,
+            payload,
+        )
+
+    def save_provenance_bundle(self):
+        if not self._ensure_results():
+            return
+
+        path = filedialog.asksaveasfilename(
+            title="Save corrected-image provenance bundle",
+            defaultextension=".json",
+            filetypes=[
+                ("Provenance JSON", "*.json"),
+                ("Text file", "*.txt"),
+                ("All files", "*.*"),
+            ],
+            initialfile=f"{self._safe_current_stem()}_provenance.json",
+        )
+
+        if not path:
+            return
+
+        path = Path(path)
+        stem = path.with_suffix("")
+
+        try:
+            payload = self._corrected_provenance_payload(
+                output_file=None
+            )
+            json_path, txt_path = write_provenance_bundle(
+                stem,
+                payload,
+            )
+
+            self.status_var.set(
+                f"Saved provenance: {json_path.name} + {txt_path.name}"
+            )
+        except Exception as exc:
+            messagebox.showerror(
+                "Provenance export error",
+                str(exc),
+            )
+
     def save_corrected(self):
         if not self._ensure_results():
             return
@@ -3486,10 +3839,32 @@ class XRDToolkitApp(tk.Tk):
             initialfile=f"{self._safe_current_stem()}_corrected.tif",
         )
 
-        if path:
+        if not path:
+            return
+
+        try:
             save_float_tiff(
                 path,
                 self.results["corrected"],
+            )
+
+            if self.provenance_auto_sidecars.get():
+                json_path, txt_path = self._write_corrected_provenance_sidecars(
+                    path
+                )
+                self.status_var.set(
+                    f"Saved {Path(path).name} with provenance sidecars "
+                    f"{json_path.name} and {txt_path.name}"
+                )
+            else:
+                self.status_var.set(
+                    f"Saved corrected TIFF: {Path(path).name}"
+                )
+
+        except Exception as exc:
+            messagebox.showerror(
+                "Corrected TIFF export error",
+                str(exc),
             )
 
     def save_enhanced(self):
