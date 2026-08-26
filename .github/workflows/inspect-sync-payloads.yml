@@ -1,0 +1,35 @@
+name: Inspect sync payloads
+on:
+  push:
+    branches: [release/v0.7.2-sync]
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Inspect payloads
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import lzma, zlib, gzip, bz2, io, tarfile, zipfile
+          for p in sorted(Path('.sync').glob('payload*.bin')):
+              raw=p.read_bytes(); print('\n',p,'raw',len(raw),raw[:16])
+              candidates=[('raw',raw)]
+              for name,fn in [('xz',lzma.decompress),('zlib',zlib.decompress),('gzip',gzip.decompress),('bz2',bz2.decompress)]:
+                  try:
+                      dec=fn(raw); candidates.append((name,dec)); print(name,'decoded',len(dec),dec[:80])
+                  except Exception as e:
+                      print(name,'no',type(e).__name__)
+              for name,data in candidates:
+                  bio=io.BytesIO(data)
+                  try:
+                      with tarfile.open(fileobj=bio, mode='r:*') as tf:
+                          print(name,'TAR',[(m.name,m.size) for m in tf.getmembers()[:50]])
+                  except Exception: pass
+                  try:
+                      with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                          print(name,'ZIP',[(i.filename,i.file_size) for i in zf.infolist()[:50]])
+                  except Exception: pass
+          PY
