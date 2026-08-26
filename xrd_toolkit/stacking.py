@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import os
@@ -27,6 +27,15 @@ class StackSettings:
     huber_iterations: int = 3
     noise_weight_floor: float = 1e-6
     chunk_rows: int = 128
+
+    # Dataset / exposure normalization. ``frame_exposures`` maps absolute or
+    # filename keys to integration times in seconds.
+    normalization_mode: str = "none"  # none | exposure
+    reference_exposure_seconds: float = 1.0
+    frame_exposures: dict[str, float] = field(default_factory=dict)
+    frame_exposure_sources: dict[str, str] = field(default_factory=dict)
+    frame_exposure_candidates: dict[str, dict] = field(default_factory=dict)
+    input_correction_state: str = "already dark + flat corrected"
 
     # Performance
     compute_backend: str = "auto"
@@ -120,6 +129,13 @@ class FrameStat:
     stack_weight: float | None = None
     shift_y: int = 0
     shift_x: int = 0
+    exposure_seconds: float | None = None
+    exposure_source: str | None = None
+    filename_exposure_seconds: float | None = None
+    header_exposure_seconds: float | None = None
+    header_integration_seconds: float | None = None
+    exposure_mismatch: bool = False
+    normalization_factor: float = 1.0
 
     def to_dict(self):
         return asdict(self)
@@ -144,9 +160,9 @@ class StackResult:
             effective_n = float((np.sum(weights) ** 2) / np.sum(weights * weights))
         snr_gain = None
         if n > 0 and method in {
-            "mean", "sum", "inverse-variance weighted mean"
+            "mean", "sum", "inverse-variance weighted mean", "exposure-weighted mean"
         }:
-            snr_gain = float(np.sqrt(effective_n if method == "inverse-variance weighted mean" else n))
+            snr_gain = float(np.sqrt(effective_n if method in {"inverse-variance weighted mean", "exposure-weighted mean"} else n))
         return {
             "frame_count": n,
             "method": self.settings.method,
@@ -155,6 +171,9 @@ class StackResult:
             "compute_backend": resolve_backend(self.settings.compute_backend),
             "effective_frame_count": effective_n,
             "approximate_snr_gain_vs_one_frame": snr_gain,
+            "normalization_mode": self.settings.normalization_mode,
+            "reference_exposure_seconds": self.settings.reference_exposure_seconds,
+            "input_correction_state": self.settings.input_correction_state,
         }
 
 
@@ -381,6 +400,50 @@ def _sampled_noise_sigma(image, target=131072):
     return float(sigma) if sigma > 0 else np.nan
 
 
+def _frame_exposure_seconds(settings, path):
+    mode = str(getattr(settings, "normalization_mode", "none")).lower().strip()
+    if mode != "exposure":
+        return None
+    mapping = getattr(settings, "frame_exposures", {}) or {}
+    path = Path(path)
+    keys = [str(path), str(path.resolve()), path.name]
+    for key in keys:
+        if key in mapping:
+            value = float(mapping[key])
+            if not np.isfinite(value) or value <= 0:
+                raise ValueError(f"{path.name}: exposure time must be positive; got {value!r}.")
+            return value
+    raise ValueError(
+        f"{path.name}: exposure normalization is enabled but no exposure time is assigned."
+    )
+
+
+def _lookup_frame_mapping(mapping, path, default=None):
+    mapping = mapping or {}
+    path = Path(path)
+    for key in (str(path), str(path.resolve()), path.name):
+        if key in mapping:
+            return mapping[key]
+    return default
+
+
+def _frame_exposure_metadata(settings, path):
+    source = _lookup_frame_mapping(getattr(settings, "frame_exposure_sources", {}), path)
+    candidates = _lookup_frame_mapping(getattr(settings, "frame_exposure_candidates", {}), path, {}) or {}
+    return source, candidates
+
+
+def _apply_frame_normalization(image, settings, path):
+    exposure = _frame_exposure_seconds(settings, path)
+    if exposure is None:
+        return image, None, 1.0
+    reference_exposure = float(getattr(settings, "reference_exposure_seconds", 1.0))
+    if not np.isfinite(reference_exposure) or reference_exposure <= 0:
+        raise ValueError("Reference exposure must be positive when exposure normalization is enabled.")
+    factor = reference_exposure / exposure
+    return np.asarray(image, dtype=np.float32) * np.float32(factor), exposure, factor
+
+
 def _load_and_prepare_frame(path, expected_shape, reference, settings, registration_reference=None):
     image, meta = load_tiff(path, dtype=np.float32, maxworkers=_io_workers(settings))
     if image.shape != expected_shape:
@@ -396,6 +459,15 @@ def _load_and_prepare_frame(path, expected_shape, reference, settings, registrat
             )
         image = apply_integer_translation(image, dy, dx)
 
+    image, exposure_seconds, normalization_factor = _apply_frame_normalization(
+        image, settings, path
+    )
+    exposure_source, exposure_candidates = _frame_exposure_metadata(settings, path)
+    if exposure_seconds is None:
+        selected_exposure = _lookup_frame_mapping(getattr(settings, "frame_exposures", {}), path)
+        if selected_exposure is not None:
+            exposure_seconds = float(selected_exposure)
+
     mean, median, maximum = _sampled_stats(image)
     corr = sampled_correlation(reference, image) if reference is not None else 1.0
     noise_sigma = _sampled_noise_sigma(image)
@@ -404,6 +476,13 @@ def _load_and_prepare_frame(path, expected_shape, reference, settings, registrat
         mean=mean, median=median, maximum=maximum,
         correlation_to_reference=corr, noise_sigma=noise_sigma, stack_weight=None,
         shift_y=dy, shift_x=dx,
+        exposure_seconds=exposure_seconds,
+        exposure_source=exposure_source,
+        filename_exposure_seconds=exposure_candidates.get("filename_exposure_seconds"),
+        header_exposure_seconds=exposure_candidates.get("header_exposure_seconds"),
+        header_integration_seconds=exposure_candidates.get("marccd_integration_seconds"),
+        exposure_mismatch=bool(exposure_candidates.get("exposure_mismatch", False)),
+        normalization_factor=float(normalization_factor),
     )
     all_finite = np.issubdtype(np.dtype(meta["dtype"]), np.integer) and not settings.align
     return image, stat, all_finite
@@ -611,7 +690,7 @@ def build_stack(paths, settings: StackSettings, progress_callback=None):
     allowed = {
         'mean', 'sum', 'median', 'sigma-clipped mean',
         'trimmed mean', 'winsorized mean', 'min/max rejected mean',
-        'inverse-variance weighted mean', 'huber mean',
+        'inverse-variance weighted mean', 'exposure-weighted mean', 'huber mean',
     }
     if method not in allowed:
         raise ValueError(f'Unknown stack method {settings.method!r}.')
@@ -665,6 +744,35 @@ def build_stack(paths, settings: StackSettings, progress_callback=None):
             valid = counts > 0
             result[valid] = accumulator[valid] / counts[valid] if method == 'mean' else accumulator[valid]
         result = result.astype(np.float32)
+
+    elif method == 'exposure-weighted mean':
+        if str(settings.normalization_mode).lower().strip() != 'exposure':
+            raise ValueError('Exposure-weighted mean requires exposure normalization to be enabled.')
+        numerator = np.zeros(expected_shape, dtype=np.float64)
+        denominator = np.zeros(expected_shape, dtype=np.float64)
+
+        for i, path in enumerate(paths, start=1):
+            report('loading', i - 1, len(paths), f'Loading {path.name}')
+            image, stat, _ = _load_and_prepare_frame(
+                path, expected_shape, reference, settings, registration_reference
+            )
+            weight = float(stat.exposure_seconds)
+            stat.stack_weight = weight
+            frame_stats.append(stat)
+            valid = np.isfinite(image)
+            numerator[valid] += weight * image[valid]
+            denominator[valid] += weight
+            report('loading', i, len(paths), f'Added {path.name}')
+
+        weights = np.asarray([st.stack_weight for st in frame_stats], dtype=float)
+        meanw = np.mean(weights) if weights.size else 1.0
+        if meanw > 0:
+            for st in frame_stats:
+                st.stack_weight = float(st.stack_weight / meanw)
+
+        result = np.full(expected_shape, np.nan, dtype=np.float32)
+        good = denominator > 0
+        result[good] = (numerator[good] / denominator[good]).astype(np.float32)
 
     elif method == 'inverse-variance weighted mean':
         numerator = np.zeros(expected_shape, dtype=np.float64)

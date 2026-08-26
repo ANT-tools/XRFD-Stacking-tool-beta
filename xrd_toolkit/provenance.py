@@ -111,6 +111,18 @@ FIELD_DESCRIPTIONS = {
         "List of TIFF files included in the temporal stack.",
     "stacking.approximate_ideal_snr_gain":
         "Idealized random-noise SNR gain reported for methods where sqrt(N) scaling is meaningful; systematic errors are not removed by this factor.",
+    "stacking.input_correction_state":
+        "Declared correction state of the input frames before stacking, used to document whether upstream dark/flat correction was already performed.",
+    "stacking.frame_normalization_mode":
+        "Per-frame normalization applied before stacking. exposure means frames were rescaled to a common reference exposure.",
+    "stacking.reference_exposure_seconds":
+        "Reference integration time used when exposure normalization is enabled; output intensities are counts equivalent to this exposure.",
+    "stacking.frame_exposures_seconds":
+        "Per-file exposure times selected for stacking. These may come from filenames, manual assignment, CSV import, or a confirmed detector header.",
+    "stacking.frame_exposure_sources":
+        "Per-file provenance of the selected exposure value, such as filename, manual, CSV, or confirmed detector header.",
+    "stacking.frame_exposure_candidates":
+        "Per-file diagnostic exposure candidates retained alongside the selected value, including filename exposure, header exposure, MarCCD integration time, and mismatch status.",
 
     # references
     "reference_frames.dark_file":
