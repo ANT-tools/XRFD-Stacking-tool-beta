@@ -1,0 +1,69 @@
+name: Sync v0.7.2 source tree
+on:
+  push:
+    branches: [release/v0.7.2-sync]
+permissions:
+  contents: write
+jobs:
+  sync:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Decode release overlay
+        run: |
+          set -euo pipefail
+          cat .sync/payload1.bin .sync/payload2.bin .sync/payload3.bin | tr -d '\n\r ' | base64 -d > /tmp/v072.tar.xz
+          xz -t /tmp/v072.tar.xz
+          mkdir -p /tmp/v072
+          tar -xJf /tmp/v072.tar.xz -C /tmp/v072
+          echo 'Overlay contents:'
+          find /tmp/v072 -type f -print | sort
+      - name: Apply approved source files
+        run: |
+          set -euo pipefail
+          SRC=/tmp/v072
+          for f in \
+            README.md \
+            pyproject.toml \
+            docs/exposure-handling.md \
+            docs/stacking-algorithms.md \
+            docs/releases/0.7.0.md \
+            docs/releases/0.7.1.md \
+            docs/releases/0.7.2.md \
+            tests/test_v070_core.py \
+            xrd_toolkit/__init__.py \
+            xrd_toolkit/__main__.py \
+            xrd_toolkit/comparison.py \
+            xrd_toolkit/gui.py \
+            xrd_toolkit/io_utils.py \
+            xrd_toolkit/layer_lines.py \
+            xrd_toolkit/provenance.py \
+            xrd_toolkit/roi.py \
+            xrd_toolkit/session.py \
+            xrd_toolkit/stacking.py
+          do
+            test -f "$SRC/$f"
+            mkdir -p "$(dirname "$f")"
+            cp "$SRC/$f" "$f"
+          done
+          rm -rf .sync
+          rm -f .github/workflows/inspect-sync-payloads.yml
+          rm -f .github/workflows/sync-v072.yml
+      - name: Verify package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+          python -m compileall -q xrd_toolkit
+          pytest -q
+      - name: Commit synchronized release
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git status --short
+          git commit -m 'Release XRD Image Toolkit v0.7.2'
+          git push origin HEAD:release/v0.7.2-sync
