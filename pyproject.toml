@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xrfd-image-toolkit"
-version = "0.6.1"
-description = "Desktop toolkit for CCD/area-detector X-ray fiber diffraction TIFF processing"
+version = "0.7.2"
+description = "Desktop toolkit for CCD/area-detector X-ray fiber diffraction TIFF processing and analysis"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {file = "LICENSE"}

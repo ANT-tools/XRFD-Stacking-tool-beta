@@ -20,6 +20,9 @@ from .io_utils import (
     load_tiff,
     list_tiffs,
     inspect_tiff_output_shape,
+    inspect_tiff_exposure_seconds,
+    inspect_tiff_exposure_info,
+    select_exposure_from_info,
     save_float_tiff,
     save_mask_tiff,
     save_csv,
@@ -35,9 +38,16 @@ from .symmetry import SymmetrySettings, build_symmetry_average
 from .provenance import utc_timestamp, sha256_file, write_provenance_bundle
 from .backend import get_gpu_info, resolve_backend
 from .axis_detection import AxisDetectionSettings, detect_beam_center_and_fiber_axis
+from .layer_lines import (
+    detector_to_fiber, fiber_to_detector, fit_evenly_spaced_layer_lines,
+    suggest_anchor_from_axial_profile, sample_fiber_strip, fit_profile_peaks,
+)
+from .roi import ROIShape, measure_roi
+from .comparison import compare_images
+from .session import save_session, load_session
 
 
-APP_TITLE = "XRD Image Toolkit 0.6.1"
+APP_TITLE = "XRD Image Toolkit 0.7.2"
 
 
 class XRDToolkitApp(tk.Tk):
@@ -68,6 +78,7 @@ class XRDToolkitApp(tk.Tk):
         self.folder_path = None
         self.folder_entries = []
         self.folder_common_shape = None
+        self._tree_selection_anchor = None
 
         self.stack_result = None
         self.symmetry_result = None
@@ -76,6 +87,20 @@ class XRDToolkitApp(tk.Tk):
 
         self.click_mode = None
         self.axis_click_points = []
+
+        # Interactive analysis state
+        self.rois = []
+        self.roi_counter = 0
+        self.roi_draw_mode = None
+        self.roi_drag_start = None
+        self.roi_preview_patch = None
+        self.layer_line_result = None
+        self.layer_line_peak_results = {}
+        self.comparison_a = None
+        self.comparison_b = None
+        self.comparison_a_label = None
+        self.comparison_b_label = None
+        self.comparison_result = None
 
         self.worker_queue = queue.Queue()
         self.worker_active = False
@@ -178,6 +203,37 @@ class XRDToolkitApp(tk.Tk):
         self.stack_huber_iterations = tk.IntVar(value=3)
         self.stack_noise_weight_floor = tk.DoubleVar(value=1e-6)
         self.stack_chunk_rows = tk.IntVar(value=128)
+        self.stack_normalization_mode = tk.StringVar(value="none")
+        self.stack_reference_exposure = tk.DoubleVar(value=1.0)
+        self.input_correction_state = tk.StringVar(value="already dark + flat corrected")
+        self.exposure_batch_value = tk.DoubleVar(value=1.0)
+        self.exposure_batch_unit = tk.StringVar(value="s")
+        self.exposure_auto_policy = tk.StringVar(value="filename only")
+
+        # Layer-line analysis
+        self.layer_line_count = tk.IntVar(value=7)
+        self.layer_line_anchor_offset = tk.DoubleVar(value=0.0)
+        self.layer_line_refine_radius = tk.DoubleVar(value=8.0)
+        self.layer_line_inner_perp = tk.DoubleVar(value=20.0)
+        self.layer_line_outer_perp = tk.DoubleVar(value=0.0)
+        self.layer_line_half_width = tk.DoubleVar(value=2.0)
+        self.layer_line_selected_index = tk.IntVar(value=0)
+        self.layer_line_max_peaks = tk.IntVar(value=4)
+        self.layer_line_peak_prominence = tk.DoubleVar(value=0.0)
+        self.layer_line_summary_var = tk.StringVar(value="No layer-line model fitted.")
+
+        # ROI / annotation tools
+        self.roi_source = tk.StringVar(value="Corrected")
+        self.roi_summary_var = tk.StringVar(value="No ROI selected.")
+
+        # Image comparison
+        self.comparison_mode = tk.StringVar(value="difference")
+        self.comparison_scale_mode = tk.StringVar(value="least-squares fit")
+        self.comparison_manual_scale = tk.DoubleVar(value=1.0)
+        self.comparison_alpha = tk.DoubleVar(value=0.5)
+        self.comparison_exposure_a = tk.DoubleVar(value=1.0)
+        self.comparison_exposure_b = tk.DoubleVar(value=1.0)
+        self.comparison_summary_var = tk.StringVar(value="Load comparison images A and B.")
 
         # Symmetry / quadrant-folding settings
         self.symmetry_mode = tk.StringVar(value="four-quadrant")
@@ -283,7 +339,7 @@ class XRDToolkitApp(tk.Tk):
         tree_frame = ttk.Frame(parent)
         tree_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
 
-        columns = ("use", "file", "shape", "mean", "max", "corr")
+        columns = ("use", "file", "shape", "exposure", "exp_source", "header_exp", "exp_qc", "mean", "max", "corr")
         self.file_tree = ttk.Treeview(
             tree_frame,
             columns=columns,
@@ -294,6 +350,10 @@ class XRDToolkitApp(tk.Tk):
         self.file_tree.heading("use", text="Use")
         self.file_tree.heading("file", text="File")
         self.file_tree.heading("shape", text="Size")
+        self.file_tree.heading("exposure", text="Exp(s)")
+        self.file_tree.heading("exp_source", text="Source")
+        self.file_tree.heading("header_exp", text="Hdr(s)")
+        self.file_tree.heading("exp_qc", text="Exp QC")
         self.file_tree.heading("mean", text="Mean")
         self.file_tree.heading("max", text="Max")
         self.file_tree.heading("corr", text="Corr")
@@ -301,6 +361,10 @@ class XRDToolkitApp(tk.Tk):
         self.file_tree.column("use", width=45, minwidth=40, anchor="center")
         self.file_tree.column("file", width=185, minwidth=110)
         self.file_tree.column("shape", width=95, minwidth=80, anchor="center")
+        self.file_tree.column("exposure", width=72, minwidth=60, anchor="e")
+        self.file_tree.column("exp_source", width=92, minwidth=75, anchor="w")
+        self.file_tree.column("header_exp", width=65, minwidth=58, anchor="e")
+        self.file_tree.column("exp_qc", width=90, minwidth=70, anchor="center")
         self.file_tree.column("mean", width=70, minwidth=55, anchor="e")
         self.file_tree.column("max", width=75, minwidth=60, anchor="e")
         self.file_tree.column("corr", width=65, minwidth=55, anchor="e")
@@ -310,21 +374,35 @@ class XRDToolkitApp(tk.Tk):
             orient=tk.VERTICAL,
             command=self.file_tree.yview,
         )
-        self.file_tree.configure(yscrollcommand=yscroll.set)
+        xscroll = ttk.Scrollbar(
+            tree_frame,
+            orient=tk.HORIZONTAL,
+            command=self.file_tree.xview,
+        )
+        self.file_tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
 
         self.file_tree.grid(row=0, column=0, sticky="nsew")
         yscroll.grid(row=0, column=1, sticky="ns")
+        xscroll.grid(row=1, column=0, sticky="ew")
 
         tree_frame.columnconfigure(0, weight=1)
         tree_frame.rowconfigure(0, weight=1)
 
         self.file_tree.tag_configure("excluded", foreground="#777777")
         self.file_tree.tag_configure("shape_mismatch", foreground="#b00020")
+        self.file_tree.tag_configure("exposure_mismatch", background="#fff0b3")
+        self.file_tree.tag_configure("exposure_unknown", background="#ffd9d9")
 
         self.file_tree.bind(
             "<<TreeviewSelect>>",
             self._preview_focused_tree_item,
         )
+        # Tk/ttk multi-selection semantics differ subtly by platform. These
+        # explicit bindings guarantee additive Ctrl+Shift range selection.
+        self.file_tree.bind("<Button-1>", self._tree_plain_click, add="+")
+        self.file_tree.bind("<Shift-Button-1>", self._tree_shift_click)
+        self.file_tree.bind("<Control-Button-1>", self._tree_ctrl_click)
+        self.file_tree.bind("<Control-Shift-Button-1>", self._tree_ctrl_shift_click)
         self.file_tree.bind(
             "<Double-1>",
             self._tree_double_click,
@@ -385,35 +463,120 @@ class XRDToolkitApp(tk.Tk):
         ttk.Label(
             parent,
             text=(
-                "Single-click a row to preview it. Ctrl/Shift selects multiple "
-                "rows. Double-click, press Space, or use the buttons above to "
+                "Click selects one row; Ctrl+click toggles rows; Shift+click selects a range; "
+                "Ctrl+Shift+click adds a range to the existing selection. Double-click, press "
+                "Space, or use the buttons above to "
                 "change whether selected frames are included in the stack."
             ),
             wraplength=370,
             justify=tk.LEFT,
         ).pack(fill=tk.X, padx=8, pady=(2, 8))
 
+    def _create_scrollable_notebook_tab(self, text):
+        """Create a notebook page with a vertically scrollable content frame.
+
+        The returned content frame can be used exactly like the previous static
+        tab frame, so existing tab builders do not need to know about the canvas.
+        """
+        page = ttk.Frame(self.notebook)
+        self.notebook.add(page, text=text)
+
+        canvas = tk.Canvas(
+            page,
+            highlightthickness=0,
+            borderwidth=0,
+            takefocus=False,
+        )
+        scrollbar = ttk.Scrollbar(
+            page,
+            orient=tk.VERTICAL,
+            command=canvas.yview,
+        )
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        content = ttk.Frame(canvas)
+        window_id = canvas.create_window(
+            (0, 0),
+            window=content,
+            anchor="nw",
+        )
+
+        def update_scroll_region(_event=None):
+            bbox = canvas.bbox("all")
+            if bbox is not None:
+                canvas.configure(scrollregion=bbox)
+
+        def match_content_width(event):
+            # Keep the controls fitted to the visible pane horizontally while
+            # allowing the content to grow vertically.
+            canvas.itemconfigure(window_id, width=max(1, event.width))
+
+        content.bind("<Configure>", update_scroll_region, add="+")
+        canvas.bind("<Configure>", match_content_width, add="+")
+
+        # Mark the page/content/canvas so the application-wide mouse-wheel
+        # router can find the correct scrollable tab from any child widget.
+        page._vertical_scroll_canvas = canvas
+        content._vertical_scroll_canvas = canvas
+        canvas._vertical_scroll_canvas = canvas
+
+        return page, content
+
+    def _route_tab_mousewheel(self, event):
+        """Route mouse-wheel motion to the scrollable control tab under it."""
+        widget = getattr(event, "widget", None)
+        canvas = None
+
+        while widget is not None:
+            canvas = getattr(widget, "_vertical_scroll_canvas", None)
+            if canvas is not None:
+                break
+            widget = getattr(widget, "master", None)
+
+        if canvas is None:
+            return None
+
+        bbox = canvas.bbox("all")
+        if bbox is None or (bbox[3] - bbox[1]) <= canvas.winfo_height():
+            return None
+
+        if getattr(event, "num", None) == 4:      # Linux wheel up
+            units = -3
+        elif getattr(event, "num", None) == 5:    # Linux wheel down
+            units = 3
+        else:
+            delta = getattr(event, "delta", 0)
+            if delta == 0:
+                return None
+            # Windows commonly reports multiples of 120. High-resolution
+            # wheels/trackpads may report smaller values, so preserve direction.
+            magnitude = max(1, abs(int(delta)) // 120)
+            units = -magnitude if delta > 0 else magnitude
+
+        canvas.yview_scroll(units, "units")
+        return "break"
+
     def _build_controls(self, parent):
         self.notebook = ttk.Notebook(parent)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
 
-        self.tab_stack = ttk.Frame(self.notebook)
-        self.tab_corr = ttk.Frame(self.notebook)
-        self.tab_filter = ttk.Frame(self.notebook)
-        self.tab_contrast = ttk.Frame(self.notebook)
-        self.tab_symmetry = ttk.Frame(self.notebook)
-        self.tab_fiber = ttk.Frame(self.notebook)
-        self.tab_performance = ttk.Frame(self.notebook)
-        self.tab_export = ttk.Frame(self.notebook)
-
-        self.notebook.add(self.tab_stack, text="Stacking")
-        self.notebook.add(self.tab_corr, text="Corrections")
-        self.notebook.add(self.tab_filter, text="Spatial Filters")
-        self.notebook.add(self.tab_contrast, text="Contrast")
-        self.notebook.add(self.tab_symmetry, text="Symmetry")
-        self.notebook.add(self.tab_fiber, text="Fiber Analysis")
-        self.notebook.add(self.tab_performance, text="Performance")
-        self.notebook.add(self.tab_export, text="Export")
+        # Every control tab is scrollable. The public self.tab_* attributes
+        # refer to the inner content frames so the existing builders continue
+        # to work unchanged.
+        self.page_stack, self.tab_stack = self._create_scrollable_notebook_tab("Stacking")
+        self.page_corr, self.tab_corr = self._create_scrollable_notebook_tab("Corrections")
+        self.page_filter, self.tab_filter = self._create_scrollable_notebook_tab("Spatial Filters")
+        self.page_contrast, self.tab_contrast = self._create_scrollable_notebook_tab("Contrast")
+        self.page_symmetry, self.tab_symmetry = self._create_scrollable_notebook_tab("Symmetry")
+        self.page_fiber, self.tab_fiber = self._create_scrollable_notebook_tab("Fiber Analysis")
+        self.page_layer_lines, self.tab_layer_lines = self._create_scrollable_notebook_tab("Layer Lines")
+        self.page_roi, self.tab_roi = self._create_scrollable_notebook_tab("ROI / Shapes")
+        self.page_comparison, self.tab_comparison = self._create_scrollable_notebook_tab("Compare")
+        self.page_performance, self.tab_performance = self._create_scrollable_notebook_tab("Performance")
+        self.page_export, self.tab_export = self._create_scrollable_notebook_tab("Export")
 
         self._build_stacking_tab()
         self._build_corrections_tab()
@@ -421,8 +584,18 @@ class XRDToolkitApp(tk.Tk):
         self._build_contrast_tab()
         self._build_symmetry_tab()
         self._build_fiber_tab()
+        self._build_layer_lines_tab()
+        self._build_roi_tab()
+        self._build_comparison_tab()
         self._build_performance_tab()
         self._build_export_tab()
+
+        # Use an application-wide wheel binding, but scroll only when the event
+        # originated from a widget inside one of the marked notebook pages.
+        # This lets the wheel work over entries, buttons, labels, and frames.
+        self.bind_all("<MouseWheel>", self._route_tab_mousewheel, add="+")
+        self.bind_all("<Button-4>", self._route_tab_mousewheel, add="+")
+        self.bind_all("<Button-5>", self._route_tab_mousewheel, add="+")
 
     def _build_viewer(self, parent):
         toolbar = ttk.Frame(parent)
@@ -444,6 +617,7 @@ class XRDToolkitApp(tk.Tk):
                 "Symmetrized",
                 "Asymmetry",
                 "Symmetry contributors",
+                "Comparison",
             ],
             width=18,
             state="readonly",
@@ -492,6 +666,14 @@ class XRDToolkitApp(tk.Tk):
         self.canvas.mpl_connect(
             "button_press_event",
             self._on_image_click,
+        )
+        self.canvas.mpl_connect(
+            "button_release_event",
+            self._on_image_release,
+        )
+        self.canvas.mpl_connect(
+            "motion_notify_event",
+            self._on_image_motion,
         )
 
     def _section(self, parent, title):
@@ -568,11 +750,82 @@ class XRDToolkitApp(tk.Tk):
                 "winsorized mean",
                 "min/max rejected mean",
                 "inverse-variance weighted mean",
+                "exposure-weighted mean",
                 "huber mean",
             ],
             state="readonly",
-            width=20,
+            width=24,
         ).pack(side=tk.RIGHT)
+
+        exposure = self._section(
+            self.tab_stack,
+            "Input correction state / exposure normalization",
+        )
+        r = ttk.Frame(exposure); r.pack(fill=tk.X, padx=6, pady=3)
+        ttk.Label(r, text="Input correction state").pack(side=tk.LEFT)
+        ttk.Combobox(
+            r,
+            textvariable=self.input_correction_state,
+            values=[
+                "already dark + flat corrected",
+                "raw / uncorrected",
+                "custom / mixed",
+            ],
+            state="readonly",
+            width=27,
+        ).pack(side=tk.RIGHT)
+
+        r = ttk.Frame(exposure); r.pack(fill=tk.X, padx=6, pady=3)
+        ttk.Label(r, text="Frame normalization").pack(side=tk.LEFT)
+        ttk.Combobox(
+            r,
+            textvariable=self.stack_normalization_mode,
+            values=["none", "exposure"],
+            state="readonly",
+            width=18,
+        ).pack(side=tk.RIGHT)
+        self._entry_row(exposure, "Reference exposure (s)", self.stack_reference_exposure)
+
+        prow = ttk.Frame(exposure); prow.pack(fill=tk.X, padx=6, pady=3)
+        ttk.Label(prow, text="Automatic exposure source").pack(side=tk.LEFT)
+        policy_box = ttk.Combobox(
+            prow,
+            textvariable=self.exposure_auto_policy,
+            values=["filename only", "filename → header", "header → filename"],
+            state="readonly",
+            width=20,
+        )
+        policy_box.pack(side=tk.RIGHT)
+        policy_box.bind("<<ComboboxSelected>>", self._exposure_policy_changed)
+
+        vrow = ttk.Frame(exposure); vrow.pack(fill=tk.X, padx=6, pady=3)
+        ttk.Label(vrow, text="Manual exposure").pack(side=tk.LEFT)
+        ttk.Entry(vrow, textvariable=self.exposure_batch_value, width=10).pack(side=tk.RIGHT, padx=(4,0))
+        ttk.Combobox(
+            vrow, textvariable=self.exposure_batch_unit, values=["s", "ms"],
+            state="readonly", width=5,
+        ).pack(side=tk.RIGHT)
+
+        erow = ttk.Frame(exposure); erow.pack(fill=tk.X, padx=6, pady=3)
+        ttk.Button(erow, text="Set selected", command=self.set_selected_exposure).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0,2))
+        ttk.Button(erow, text="Set all", command=self.set_all_exposure).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
+        ttk.Button(erow, text="Import CSV…", command=self.import_exposure_csv).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(2,0))
+
+        erow2 = ttk.Frame(exposure); erow2.pack(fill=tk.X, padx=6, pady=3)
+        ttk.Button(erow2, text="Clear manual", command=self.clear_selected_manual_exposure).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0,2))
+        ttk.Button(erow2, text="Re-detect selected", command=self.redetect_selected_exposure).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
+        ttk.Button(erow2, text="Use header selected", command=self.use_header_for_selected_exposure).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(2,0))
+
+        ttk.Label(
+            exposure,
+            text=(
+                "Default: use only explicit filename tokens such as _5s_, _10s_ or _500ms_. "
+                "Rayonix/MarCCD header timing is shown as a diagnostic because it can disagree "
+                "with the acquisition filename. Manual/CSV values always override automatic values."
+            ),
+            wraplength=365,
+            justify=tk.LEFT,
+        ).pack(fill=tk.X, padx=6, pady=4)
 
         reg = self._section(
             self.tab_stack,
@@ -1334,6 +1587,414 @@ class XRDToolkitApp(tk.Tk):
             justify=tk.LEFT,
         ).pack(fill=tk.X, padx=10, pady=8)
 
+    def _build_layer_lines_tab(self):
+        setup = self._section(self.tab_layer_lines, "Layer-line ladder")
+        self._entry_row(setup, "Lines: equator → anchor", self.layer_line_count)
+        self._entry_row(setup, "Anchor offset along fiber (px)", self.layer_line_anchor_offset)
+        self._entry_row(setup, "Refine radius (px)", self.layer_line_refine_radius)
+        self._entry_row(setup, "Exclude meridian ± (px)", self.layer_line_inner_perp)
+        self._entry_row(setup, "Outer integration |perp| (0=auto)", self.layer_line_outer_perp)
+        r = ttk.Frame(setup); r.pack(fill=tk.X, padx=6, pady=3)
+        ttk.Button(r, text="Click anchor", command=self.start_layer_anchor_click).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0,2))
+        ttk.Button(r, text="Suggest anchor", command=self.suggest_layer_anchor).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
+        ttk.Button(r, text="Fit lines", command=self.fit_layer_lines).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(2,0))
+        ttk.Label(
+            setup,
+            text=(
+                "The count includes the equator. Example: 7 means line 0 is the equator and line 6 is the anchor. "
+                "The model is mirrored across the equator and each nominal line can be refined locally from the experimental intensity profile."
+            ),
+            wraplength=365, justify=tk.LEFT,
+        ).pack(fill=tk.X, padx=6, pady=4)
+
+        table = self._section(self.tab_layer_lines, "Fitted layer lines")
+        self.layer_tree = ttk.Treeview(table, columns=("n","nominal","measured","resid"), show="headings", height=8)
+        for col, txt, width in (("n","n",45),("nominal","Nominal px",85),("measured","Measured px",90),("resid","Residual px",85)):
+            self.layer_tree.heading(col, text=txt); self.layer_tree.column(col, width=width, anchor="e")
+        self.layer_tree.pack(fill=tk.X, padx=6, pady=3)
+        self.layer_tree.bind("<<TreeviewSelect>>", self._layer_tree_selected)
+        ttk.Label(table, textvariable=self.layer_line_summary_var, wraplength=365, justify=tk.LEFT).pack(fill=tk.X, padx=6, pady=4)
+
+        prof = self._section(self.tab_layer_lines, "Selected line profile / reflection peaks")
+        self._entry_row(prof, "Strip half-width (px)", self.layer_line_half_width)
+        self._entry_row(prof, "Max Gaussian peaks", self.layer_line_max_peaks)
+        self._entry_row(prof, "Peak prominence (0=auto)", self.layer_line_peak_prominence)
+        r = ttk.Frame(prof); r.pack(fill=tk.X, padx=6, pady=3)
+        ttk.Button(r, text="Show profile", command=self.show_selected_layer_profile).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0,2))
+        ttk.Button(r, text="Fit peaks", command=self.fit_selected_layer_peaks).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
+        ttk.Button(r, text="Export CSV…", command=self.export_layer_lines_csv).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(2,0))
+
+    def _build_roi_tab(self):
+        draw = self._section(self.tab_roi, "Non-destructive shapes / ROIs")
+        ttk.Label(
+            draw,
+            text="Drag on the detector image to create a shape. Shapes do not alter detector intensities.",
+            wraplength=365, justify=tk.LEFT,
+        ).pack(fill=tk.X, padx=6, pady=4)
+        r = ttk.Frame(draw); r.pack(fill=tk.X, padx=6, pady=3)
+        for label, mode in (("Circle","circle"),("Ellipse","ellipse"),("Rectangle","rectangle"),("Line","line")):
+            ttk.Button(r, text=label, command=lambda m=mode: self.start_roi_draw(m)).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=1)
+        r = ttk.Frame(draw); r.pack(fill=tk.X, padx=6, pady=3)
+        ttk.Button(r, text="Delete selected", command=self.delete_selected_roi).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0,2))
+        ttk.Button(r, text="Clear all", command=self.clear_rois).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
+        ttk.Button(r, text="Save/Load…", command=self.roi_save_load_menu).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(2,0))
+
+        manager = self._section(self.tab_roi, "ROI manager / measurement")
+        self.roi_listbox = tk.Listbox(manager, height=9, exportselection=False)
+        self.roi_listbox.pack(fill=tk.X, padx=6, pady=3)
+        self.roi_listbox.bind("<<ListboxSelect>>", lambda _e: self.measure_selected_roi())
+        r = ttk.Frame(manager); r.pack(fill=tk.X, padx=6, pady=3)
+        ttk.Label(r, text="Measure source").pack(side=tk.LEFT)
+        ttk.Combobox(r, textvariable=self.roi_source, values=["Raw","Corrected","Enhanced","Stack"], state="readonly", width=14).pack(side=tk.RIGHT)
+        ttk.Button(manager, text="Measure selected ROI", command=self.measure_selected_roi).pack(fill=tk.X, padx=6, pady=3)
+        ttk.Label(manager, textvariable=self.roi_summary_var, wraplength=365, justify=tk.LEFT).pack(fill=tk.X, padx=6, pady=4)
+
+    def _build_comparison_tab(self):
+        src = self._section(self.tab_comparison, "Comparison images")
+        r = ttk.Frame(src); r.pack(fill=tk.X, padx=6, pady=3)
+        ttk.Button(r, text="A = current corrected", command=lambda: self.set_comparison_from_current("A")).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0,2))
+        ttk.Button(r, text="Load A…", command=lambda: self.load_comparison_file("A")).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(2,0))
+        r = ttk.Frame(src); r.pack(fill=tk.X, padx=6, pady=3)
+        ttk.Button(r, text="B = current corrected", command=lambda: self.set_comparison_from_current("B")).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0,2))
+        ttk.Button(r, text="B = stack", command=lambda: self.set_comparison_from_stack("B")).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
+        ttk.Button(r, text="Load B…", command=lambda: self.load_comparison_file("B")).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(2,0))
+
+        cfg = self._section(self.tab_comparison, "Normalization / comparison")
+        r = ttk.Frame(cfg); r.pack(fill=tk.X, padx=6, pady=3)
+        ttk.Label(r, text="Mode").pack(side=tk.LEFT)
+        ttk.Combobox(r, textvariable=self.comparison_mode, values=["difference","absolute difference","ratio","overlay"], state="readonly", width=20).pack(side=tk.RIGHT)
+        r = ttk.Frame(cfg); r.pack(fill=tk.X, padx=6, pady=3)
+        ttk.Label(r, text="Scale B → A").pack(side=tk.LEFT)
+        ttk.Combobox(r, textvariable=self.comparison_scale_mode, values=["none","least-squares fit","total intensity","exposure","manual"], state="readonly", width=20).pack(side=tk.RIGHT)
+        self._entry_row(cfg, "Manual scale", self.comparison_manual_scale)
+        self._entry_row(cfg, "Overlay alpha (B)", self.comparison_alpha)
+        self._entry_row(cfg, "Exposure A (s)", self.comparison_exposure_a)
+        self._entry_row(cfg, "Exposure B (s)", self.comparison_exposure_b)
+        r = ttk.Frame(cfg); r.pack(fill=tk.X, padx=6, pady=3)
+        ttk.Button(r, text="Build comparison", command=self.build_comparison).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0,2))
+        ttk.Button(r, text="Side-by-side", command=self.show_comparison_side_by_side).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
+        ttk.Button(r, text="Export report…", command=self.export_comparison_report).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(2,0))
+        ttk.Button(cfg, text="Compare selected ROI in A vs B", command=self.compare_selected_roi).pack(fill=tk.X, padx=6, pady=3)
+        ttk.Label(cfg, textvariable=self.comparison_summary_var, wraplength=365, justify=tk.LEFT).pack(fill=tk.X, padx=6, pady=4)
+
+    # ============================================================
+    # LAYER-LINE ANALYSIS
+    # ============================================================
+
+    def start_layer_anchor_click(self):
+        if self.results is None:
+            messagebox.showinfo("Layer lines", "Load and process an image first.")
+            return
+        self.click_mode = "layer_anchor"
+        self.status_var.set("Click the anchor layer line / meridional reflection in the detector image.")
+
+    def suggest_layer_anchor(self):
+        if self.results is None:
+            messagebox.showinfo("Layer lines", "Load and process an image first.")
+            return
+        try:
+            value = suggest_anchor_from_axial_profile(
+                self.results["corrected"],
+                self.center_x.get(), self.center_y.get(), self.fiber_angle.get(),
+                min_offset_px=max(10.0, self.layer_line_inner_perp.get() * 1.5),
+            )
+            self.layer_line_anchor_offset.set(value)
+            self.status_var.set(f"Suggested positive anchor offset: {value:.2f} px. Review before fitting.")
+        except Exception as exc:
+            messagebox.showerror("Layer-line anchor", str(exc))
+
+    def fit_layer_lines(self):
+        if self.results is None:
+            messagebox.showinfo("Layer lines", "Load and process an image first.")
+            return
+        try:
+            outer = float(self.layer_line_outer_perp.get())
+            self.layer_line_result = fit_evenly_spaced_layer_lines(
+                self.results["corrected"],
+                center_x=float(self.center_x.get()),
+                center_y=float(self.center_y.get()),
+                fiber_angle_deg=float(self.fiber_angle.get()),
+                count_from_equator_to_anchor=int(self.layer_line_count.get()),
+                anchor_offset_px=float(self.layer_line_anchor_offset.get()),
+                refine_radius_px=float(self.layer_line_refine_radius.get()),
+                inner_perp_px=float(self.layer_line_inner_perp.get()),
+                outer_perp_px=(outer if outer > 0 else None),
+                symmetric=True,
+            )
+            self._populate_layer_tree()
+            r = self.layer_line_result
+            abs_res = [abs(line.residual_px) for line in r.lines if line.residual_px is not None and line.index != 0]
+            median_res = float(np.median(abs_res)) if abs_res else 0.0
+            self.layer_line_summary_var.set(
+                f"Spacing {r.nominal_spacing_px:.3f} px; anchor {r.anchor_offset_px:.2f} px; "
+                f"median |refinement residual| {median_res:.2f} px."
+            )
+            self.refresh_plot()
+        except Exception as exc:
+            messagebox.showerror("Layer-line fitting", str(exc))
+
+    def _populate_layer_tree(self):
+        if not hasattr(self, "layer_tree"):
+            return
+        self.layer_tree.delete(*self.layer_tree.get_children())
+        if self.layer_line_result is None:
+            return
+        for line in self.layer_line_result.lines:
+            self.layer_tree.insert(
+                "", "end", iid=str(line.index),
+                values=(
+                    line.index,
+                    f"{line.offset_px:.3f}",
+                    f"{line.measured_offset_px:.3f}" if line.measured_offset_px is not None else "—",
+                    f"{line.residual_px:.3f}" if line.residual_px is not None else "—",
+                ),
+            )
+        if "0" in self.layer_tree.get_children():
+            self.layer_tree.selection_set("0")
+            self.layer_line_selected_index.set(0)
+
+    def _layer_tree_selected(self, _event=None):
+        if not hasattr(self, "layer_tree"):
+            return
+        selected = self.layer_tree.selection()
+        if not selected:
+            return
+        try:
+            self.layer_line_selected_index.set(int(selected[0]))
+        except Exception:
+            pass
+
+    def _selected_layer_line(self):
+        if self.layer_line_result is None:
+            raise ValueError("Fit a layer-line model first.")
+        idx = int(self.layer_line_selected_index.get())
+        for line in self.layer_line_result.lines:
+            if line.index == idx:
+                return line
+        raise ValueError(f"Layer line {idx} is not present in the fitted model.")
+
+    def _selected_layer_profile_data(self):
+        line = self._selected_layer_line()
+        image = self.results["corrected"]
+        offset = line.measured_offset_px if line.measured_offset_px is not None else line.offset_px
+        return line, sample_fiber_strip(
+            image,
+            self.center_x.get(), self.center_y.get(), self.fiber_angle.get(),
+            parallel_offset_px=offset,
+            half_width_px=float(self.layer_line_half_width.get()),
+        )
+
+    def show_selected_layer_profile(self):
+        try:
+            line, (x, y) = self._selected_layer_profile_data()
+        except Exception as exc:
+            messagebox.showerror("Layer-line profile", str(exc)); return
+        win = tk.Toplevel(self); win.title(f"Layer line {line.index} profile")
+        fig = Figure(figsize=(8.5, 5.2), dpi=100); ax = fig.add_subplot(111)
+        ax.plot(x, y, linewidth=1.0)
+        ax.axvline(0, linewidth=0.7, alpha=0.6)
+        ax.set_xlabel("Perpendicular coordinate from meridian (pixels)")
+        ax.set_ylabel("Mean corrected intensity")
+        ax.set_title(f"Layer line {line.index} — offset {line.measured_offset_px:.2f} px")
+        fig.tight_layout(); canvas = FigureCanvasTkAgg(fig, master=win); canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True); canvas.draw_idle()
+
+    def fit_selected_layer_peaks(self):
+        try:
+            line, (x, y) = self._selected_layer_profile_data()
+            result = fit_profile_peaks(
+                x, y,
+                max_peaks=max(1, int(self.layer_line_max_peaks.get())),
+                prominence=(float(self.layer_line_peak_prominence.get()) or None),
+            )
+            self.layer_line_peak_results[int(line.index)] = result
+        except Exception as exc:
+            messagebox.showerror("Layer-line peak fit", str(exc)); return
+        win = tk.Toplevel(self); win.title(f"Layer line {line.index} Gaussian peak fit")
+        fig = Figure(figsize=(8.5, 6), dpi=100); ax = fig.add_subplot(111)
+        ax.plot(result["x"], result["y"], label="Experimental", linewidth=1.0)
+        ax.plot(result["x"], result["fit"], label="Fit", linewidth=1.2)
+        for peak in result["peaks"]:
+            ax.axvline(peak["center_px"], linestyle="--", linewidth=0.7)
+        ax.set_xlabel("Perpendicular coordinate (pixels)"); ax.set_ylabel("Corrected intensity")
+        ax.set_title(f"Layer {line.index}: {len(result['peaks'])} peak(s), R²={result['r_squared']:.5f}")
+        ax.legend(); fig.tight_layout(); canvas=FigureCanvasTkAgg(fig, master=win); canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True); canvas.draw_idle()
+
+    def export_layer_lines_csv(self):
+        if self.layer_line_result is None:
+            messagebox.showinfo("Layer lines", "Fit a layer-line model first."); return
+        path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")], initialfile=f"{self._safe_current_stem()}_layer_lines.csv")
+        if not path: return
+        with open(path, "w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["layer_index","nominal_offset_px","measured_offset_px","residual_px","profile_intensity"])
+            for line in self.layer_line_result.lines:
+                writer.writerow([line.index, line.offset_px, line.measured_offset_px, line.residual_px, line.intensity])
+        self.status_var.set(f"Saved layer-line table: {Path(path).name}")
+
+    # ============================================================
+    # ROI / SHAPE ANNOTATIONS
+    # ============================================================
+
+    def start_roi_draw(self, mode):
+        if self.raw is None:
+            messagebox.showinfo("ROI", "Load an image first."); return
+        self.roi_draw_mode = str(mode)
+        self.roi_drag_start = None
+        self.status_var.set(f"Drag on the image to draw a {mode} ROI.")
+
+    def _refresh_roi_list(self):
+        if not hasattr(self, "roi_listbox"): return
+        self.roi_listbox.delete(0, tk.END)
+        for roi in self.rois:
+            label = roi.label or roi.roi_id
+            self.roi_listbox.insert(tk.END, f"{roi.roi_id}  {roi.shape_type}  {label}")
+
+    def _selected_roi(self):
+        if not hasattr(self, "roi_listbox"): return None
+        sel = self.roi_listbox.curselection()
+        if not sel: return None
+        idx = int(sel[0])
+        return self.rois[idx] if 0 <= idx < len(self.rois) else None
+
+    def delete_selected_roi(self):
+        sel = self.roi_listbox.curselection() if hasattr(self, "roi_listbox") else ()
+        if not sel: return
+        del self.rois[int(sel[0])]
+        self._refresh_roi_list(); self.refresh_plot(); self.roi_summary_var.set("ROI deleted.")
+
+    def clear_rois(self):
+        self.rois.clear(); self._refresh_roi_list(); self.refresh_plot(); self.roi_summary_var.set("All ROIs cleared.")
+
+    def _roi_measure_image(self):
+        source = self.roi_source.get()
+        if source == "Stack":
+            if self.stack_result is None: raise ValueError("No stack has been built.")
+            return self.stack_result.image
+        if self.results is None: raise ValueError("No working image loaded.")
+        return self.results[{"Raw":"raw","Corrected":"corrected","Enhanced":"enhanced"}.get(source,"corrected")]
+
+    def measure_selected_roi(self):
+        roi = self._selected_roi()
+        if roi is None:
+            self.roi_summary_var.set("Select an ROI first."); return
+        try:
+            m = measure_roi(self._roi_measure_image(), roi)
+            self.roi_summary_var.set(
+                f"{roi.roi_id}: N={m['pixel_count']:,}; mean={m['mean']:.6g}; median={m['median']:.6g}; "
+                f"sum={m['sum']:.6g}; σ={m['std']:.6g}"
+            )
+        except Exception as exc:
+            self.roi_summary_var.set(str(exc))
+
+    def roi_save_load_menu(self):
+        save = messagebox.askyesno("ROI file", "Save current ROIs?\n\nChoose No to load an existing ROI JSON file.")
+        if save:
+            path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON", "*.json")], initialfile=f"{self._safe_current_stem()}_rois.json")
+            if path:
+                save_json(path, {"schema":"xrd_roi_shapes","version":"1.0","rois":[r.to_dict() for r in self.rois]})
+        else:
+            path = filedialog.askopenfilename(filetypes=[("JSON", "*.json"), ("All files", "*.*")])
+            if path:
+                try:
+                    data=json.loads(Path(path).read_text(encoding="utf-8")); self.rois=[ROIShape.from_dict(v) for v in data.get("rois",[])]; self.roi_counter=len(self.rois); self._refresh_roi_list(); self.refresh_plot()
+                except Exception as exc: messagebox.showerror("ROI load", str(exc))
+
+    # ============================================================
+    # IMAGE COMPARISON
+    # ============================================================
+
+    def set_comparison_from_current(self, which):
+        if self.results is None:
+            messagebox.showinfo("Compare", "Load a working image first."); return
+        image=np.array(self.results["corrected"], dtype=np.float32, copy=True); label=f"{self.current_label or 'current'} — corrected"
+        if which == "A": self.comparison_a, self.comparison_a_label = image, label
+        else: self.comparison_b, self.comparison_b_label = image, label
+        self.comparison_summary_var.set(f"A: {self.comparison_a_label or '—'}\nB: {self.comparison_b_label or '—'}")
+
+    def set_comparison_from_stack(self, which="B"):
+        if self.stack_result is None:
+            messagebox.showinfo("Compare", "Build a stack first."); return
+        image=np.array(self.stack_result.image, dtype=np.float32, copy=True); label=f"stack — {self.stack_result.settings.method}"
+        if which == "A": self.comparison_a, self.comparison_a_label = image, label
+        else: self.comparison_b, self.comparison_b_label = image, label
+        self.comparison_summary_var.set(f"A: {self.comparison_a_label or '—'}\nB: {self.comparison_b_label or '—'}")
+
+    def load_comparison_file(self, which):
+        path=filedialog.askopenfilename(title=f"Load comparison image {which}", filetypes=[("TIFF","*.tif *.tiff"),("All files","*.*")])
+        if not path: return
+        try: image,_=load_tiff(path)
+        except Exception as exc: messagebox.showerror("Comparison load",str(exc)); return
+        if which=="A": self.comparison_a,self.comparison_a_label=image,Path(path).name
+        else: self.comparison_b,self.comparison_b_label=image,Path(path).name
+        exp = None
+        try: exp=inspect_tiff_exposure_seconds(path)
+        except Exception: pass
+        if exp is not None:
+            (self.comparison_exposure_a if which=="A" else self.comparison_exposure_b).set(exp)
+        self.comparison_summary_var.set(f"A: {self.comparison_a_label or '—'}\nB: {self.comparison_b_label or '—'}")
+
+    def build_comparison(self):
+        if self.comparison_a is None or self.comparison_b is None:
+            messagebox.showinfo("Compare", "Set both comparison images A and B first."); return
+        try:
+            self.comparison_result=compare_images(
+                self.comparison_a,self.comparison_b,
+                mode=self.comparison_mode.get(), scale_mode=self.comparison_scale_mode.get(),
+                manual_scale=float(self.comparison_manual_scale.get()), alpha=float(self.comparison_alpha.get()),
+                exposure_a=float(self.comparison_exposure_a.get()), exposure_b=float(self.comparison_exposure_b.get()),
+            )
+            r=self.comparison_result
+            corr="—" if r.correlation is None else f"{r.correlation:.6f}"
+            nrms="—" if r.normalized_rms_difference is None else f"{100*r.normalized_rms_difference:.3f}%"
+            self.comparison_summary_var.set(f"Scale B→A={r.scale_b_to_a:.6g}; correlation={corr}; RMS={r.rms_difference:.6g}; normalized RMS={nrms}")
+            self.view_var.set("Comparison"); self.refresh_plot()
+        except Exception as exc: messagebox.showerror("Comparison",str(exc))
+
+    def show_comparison_side_by_side(self):
+        if self.comparison_a is None or self.comparison_b is None:
+            messagebox.showinfo("Compare", "Set both images first."); return
+        if self.comparison_a.shape != self.comparison_b.shape:
+            messagebox.showerror("Compare", f"Shapes do not match: {self.comparison_a.shape} vs {self.comparison_b.shape}"); return
+        win=tk.Toplevel(self); win.title("XRFD pattern comparison — side by side")
+        fig=Figure(figsize=(11,5.5),dpi=100); ax1=fig.add_subplot(121); ax2=fig.add_subplot(122)
+        from .processing import display_transform
+        settings=self.get_processing_settings()
+        ax1.imshow(display_transform(self.comparison_a,settings),cmap=self.cmap_var.get(),origin="upper",interpolation="nearest")
+        ax2.imshow(display_transform(self.comparison_b,settings),cmap=self.cmap_var.get(),origin="upper",interpolation="nearest")
+        ax1.set_title(self.comparison_a_label or "A"); ax2.set_title(self.comparison_b_label or "B")
+        for ax in (ax1,ax2): ax.set_xlabel("Detector X (pixels)"); ax.set_ylabel("Detector Y (pixels)")
+        fig.tight_layout(); canvas=FigureCanvasTkAgg(fig,master=win); canvas.get_tk_widget().pack(fill=tk.BOTH,expand=True); canvas.draw_idle()
+
+    def compare_selected_roi(self):
+        roi = self._selected_roi()
+        if roi is None:
+            messagebox.showinfo("Compare ROI", "Select an ROI in the ROI / Shapes tab first.")
+            return
+        if self.comparison_a is None or self.comparison_b is None:
+            messagebox.showinfo("Compare ROI", "Set comparison images A and B first.")
+            return
+        if self.comparison_a.shape != self.comparison_b.shape:
+            messagebox.showerror("Compare ROI", "A and B must have the same detector dimensions for linked ROI comparison.")
+            return
+        try:
+            ma = measure_roi(self.comparison_a, roi)
+            mb = measure_roi(self.comparison_b, roi)
+            ratio = (mb["sum"] / ma["sum"]) if ma["sum"] not in (None, 0) and mb["sum"] is not None else np.nan
+            self.comparison_summary_var.set(
+                f"{roi.roi_id}: A sum={ma['sum']:.6g}, B sum={mb['sum']:.6g}, B/A={ratio:.6g}; "
+                f"A mean={ma['mean']:.6g}, B mean={mb['mean']:.6g}."
+            )
+        except Exception as exc:
+            messagebox.showerror("Compare ROI", str(exc))
+
+    def export_comparison_report(self):
+        if self.comparison_result is None:
+            messagebox.showinfo("Compare", "Build a comparison first."); return
+        path=filedialog.asksaveasfilename(defaultextension=".json",filetypes=[("JSON","*.json")],initialfile="comparison_report.json")
+        if path:
+            payload={"image_a":self.comparison_a_label,"image_b":self.comparison_b_label,**self.comparison_result.to_dict()}
+            save_json(path,payload); self.status_var.set(f"Saved comparison report: {Path(path).name}")
+
     def _build_performance_tab(self):
         compute = self._section(self.tab_performance, "Compute backend")
 
@@ -1439,6 +2100,22 @@ class XRDToolkitApp(tk.Tk):
             )
 
     def _build_export_tab(self):
+        session = self._section(
+            self.tab_export,
+            "Analysis session",
+        )
+        r = ttk.Frame(session); r.pack(fill=tk.X, padx=6, pady=3)
+        ttk.Button(r, text="Save session…", command=self.save_analysis_session).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0,2))
+        ttk.Button(r, text="Load session…", command=self.load_analysis_session).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(2,0))
+        ttk.Label(
+            session,
+            text=(
+                "Session JSON stores file inclusion/exposure assignments, major processing/display settings, fiber geometry, "
+                "layer-line settings and non-destructive ROIs. It references source TIFF paths; it does not embed raw detector data."
+            ),
+            wraplength=370, justify=tk.LEFT,
+        ).pack(fill=tk.X, padx=6, pady=4)
+
         sharing = self._section(
             self.tab_export,
             "PNG sharing / figures",
@@ -1617,20 +2294,60 @@ class XRDToolkitApp(tk.Tk):
     # FILE PANE / INCLUSION STATE
     # ============================================================
 
+    def _apply_exposure_policy_to_entry(self, entry, preserve_manual=True):
+        if preserve_manual:
+            source = str(entry.get("exposure_source", ""))
+            if source.lower().startswith("manual") or source.lower() == "session" or source.upper().startswith("CSV"):
+                return
+        info = entry.get("exposure_info") or {}
+        exposure, source = select_exposure_from_info(info, self.exposure_auto_policy.get())
+        entry["exposure"] = exposure
+        entry["exposure_source"] = source
+
+    def _exposure_status(self, entry):
+        info = entry.get("exposure_info") or {}
+        source = str(entry.get("exposure_source") or "")
+        if info.get("exposure_mismatch"):
+            return "MISMATCH"
+        if entry.get("exposure") is None:
+            if info.get("header_exposure_seconds") is not None:
+                return "HEADER ONLY"
+            return "NEEDS VALUE"
+        if source.lower().startswith("manual"):
+            return "MANUAL"
+        if source.upper().startswith("CSV"):
+            return "CSV"
+        return "OK"
+
     def _new_entry(self, path, included=True):
         path = Path(path)
         try:
             shape = tuple(inspect_tiff_output_shape(path))
         except Exception:
             shape = None
-        return {
+        try:
+            exposure_info = inspect_tiff_exposure_info(path)
+        except Exception:
+            exposure_info = {
+                "filename_exposure_seconds": None,
+                "header_exposure_seconds": None,
+                "header_exposure_source": None,
+                "marccd_integration_seconds": None,
+                "exposure_mismatch": False,
+            }
+        entry = {
             "path": path,
             "included": bool(included),
             "shape": shape,
+            "exposure": None,
+            "exposure_source": None,
+            "exposure_info": exposure_info,
             "mean": None,
             "max": None,
             "corr": None,
         }
+        self._apply_exposure_policy_to_entry(entry, preserve_manual=False)
+        return entry
 
     def _rebuild_file_tree(self):
         self.file_tree.delete(*self.file_tree.get_children())
@@ -1662,17 +2379,27 @@ class XRDToolkitApp(tk.Tk):
                 if shape is not None
                 else "?"
             )
+            exposure = entry.get("exposure")
+            exposure_text = f"{exposure:.6g}" if exposure is not None else "—"
+            source_text = entry.get("exposure_source") or "—"
+            info = entry.get("exposure_info") or {}
+            header_exposure = info.get("header_exposure_seconds")
+            header_text = f"{header_exposure:.6g}" if header_exposure is not None else "—"
+            qc_text = self._exposure_status(entry)
 
+            tags = []
             if not entry["included"]:
-                tags = ("excluded",)
-            elif (
+                tags.append("excluded")
+            if (
                 self.folder_common_shape is not None
                 and shape is not None
                 and shape != self.folder_common_shape
             ):
-                tags = ("shape_mismatch",)
-            else:
-                tags = ()
+                tags.append("shape_mismatch")
+            if info.get("exposure_mismatch"):
+                tags.append("exposure_mismatch")
+            elif entry.get("exposure") is None:
+                tags.append("exposure_unknown")
 
             self.file_tree.insert(
                 "",
@@ -1682,11 +2409,15 @@ class XRDToolkitApp(tk.Tk):
                     use,
                     entry["path"].name,
                     shape_text,
+                    exposure_text,
+                    source_text,
+                    header_text,
+                    qc_text,
                     mean,
                     maximum,
                     corr,
                 ),
-                tags=tags,
+                tags=tuple(tags),
             )
 
         self._update_include_count()
@@ -1723,17 +2454,27 @@ class XRDToolkitApp(tk.Tk):
             if shape is not None
             else "?"
         )
+        exposure = entry.get("exposure")
+        exposure_text = f"{exposure:.6g}" if exposure is not None else "—"
+        source_text = entry.get("exposure_source") or "—"
+        info = entry.get("exposure_info") or {}
+        header_exposure = info.get("header_exposure_seconds")
+        header_text = f"{header_exposure:.6g}" if header_exposure is not None else "—"
+        qc_text = self._exposure_status(entry)
 
+        tags = []
         if not entry["included"]:
-            tags = ("excluded",)
-        elif (
+            tags.append("excluded")
+        if (
             self.folder_common_shape is not None
             and shape is not None
             and shape != self.folder_common_shape
         ):
-            tags = ("shape_mismatch",)
-        else:
-            tags = ()
+            tags.append("shape_mismatch")
+        if info.get("exposure_mismatch"):
+            tags.append("exposure_mismatch")
+        elif entry.get("exposure") is None:
+            tags.append("exposure_unknown")
 
         self.file_tree.item(
             str(idx),
@@ -1741,11 +2482,15 @@ class XRDToolkitApp(tk.Tk):
                 use,
                 entry["path"].name,
                 shape_text,
+                exposure_text,
+                source_text,
+                header_text,
+                qc_text,
                 mean,
                 maximum,
                 corr,
             ),
-            tags=tags,
+            tags=tuple(tags),
         )
 
         self._update_include_count()
@@ -1759,6 +2504,67 @@ class XRDToolkitApp(tk.Tk):
         self.include_count_label.configure(
             text=f"{included} / {len(self.folder_entries)} included"
         )
+
+    def _row_id_at_event(self, event):
+        row_id = self.file_tree.identify_row(event.y)
+        return row_id if row_id else None
+
+    def _tree_plain_click(self, event):
+        row_id = self._row_id_at_event(event)
+        if row_id:
+            self._tree_selection_anchor = row_id
+        # Return None so the native single-click selection/preview proceeds.
+        return None
+
+    def _tree_ctrl_click(self, event):
+        row_id = self._row_id_at_event(event)
+        if not row_id:
+            return "break"
+        selected = set(self.file_tree.selection())
+        if row_id in selected:
+            selected.remove(row_id)
+        else:
+            selected.add(row_id)
+        self.file_tree.selection_set(tuple(sorted(selected, key=int)))
+        self.file_tree.focus(row_id)
+        self._tree_selection_anchor = row_id
+        self._preview_focused_tree_item()
+        return "break"
+
+    def _tree_range_ids(self, anchor_id, target_id):
+        children = list(self.file_tree.get_children(""))
+        if not children or anchor_id not in children or target_id not in children:
+            return [target_id] if target_id else []
+        a = children.index(anchor_id)
+        b = children.index(target_id)
+        lo, hi = sorted((a, b))
+        return children[lo:hi + 1]
+
+    def _tree_shift_click(self, event):
+        row_id = self._row_id_at_event(event)
+        if not row_id:
+            return "break"
+        anchor = self._tree_selection_anchor or self.file_tree.focus() or row_id
+        range_ids = self._tree_range_ids(anchor, row_id)
+        self.file_tree.selection_set(range_ids)
+        self.file_tree.focus(row_id)
+        self._preview_focused_tree_item()
+        return "break"
+
+    def _tree_ctrl_shift_click(self, event):
+        """Add the anchor→clicked range without clearing existing selection."""
+        row_id = self._row_id_at_event(event)
+        if not row_id:
+            return "break"
+        anchor = self._tree_selection_anchor or self.file_tree.focus() or row_id
+        range_ids = self._tree_range_ids(anchor, row_id)
+        selected = list(self.file_tree.selection())
+        merged = set(selected)
+        merged.update(range_ids)
+        self.file_tree.selection_set(tuple(sorted(merged, key=int)))
+        self.file_tree.focus(row_id)
+        self._preview_focused_tree_item()
+        return "break"
 
     def _selected_tree_indices(self):
         out = []
@@ -1847,6 +2653,150 @@ class XRDToolkitApp(tk.Tk):
         if 0 <= idx < len(self.folder_entries):
             path = self.folder_entries[idx]["path"]
             self._load_main_image(path, keep_folder=True)
+
+    def _manual_exposure_seconds(self):
+        try:
+            value = float(self.exposure_batch_value.get())
+        except Exception:
+            value = 0.0
+        unit = str(self.exposure_batch_unit.get() or "s").strip().lower()
+        if unit == "ms":
+            value /= 1000.0
+        if not np.isfinite(value) or value <= 0:
+            raise ValueError("Exposure time must be a positive number.")
+        return float(value)
+
+    def _exposure_policy_changed(self, _event=None):
+        changed = 0
+        for idx, entry in enumerate(self.folder_entries):
+            source = str(entry.get("exposure_source") or "")
+            if source.lower().startswith("manual") or source.upper().startswith("CSV") or source.lower() == "session":
+                continue
+            self._apply_exposure_policy_to_entry(entry, preserve_manual=False)
+            self._update_tree_row(idx)
+            changed += 1
+        self.status_var.set(
+            f"Exposure policy '{self.exposure_auto_policy.get()}' applied to {changed} non-manual frame(s)."
+        )
+
+    def set_selected_exposure(self):
+        try:
+            value = self._manual_exposure_seconds()
+        except Exception as exc:
+            messagebox.showerror("Exposure", str(exc))
+            return
+        indices = self._selected_tree_indices()
+        if not indices:
+            messagebox.showinfo("Exposure", "Select one or more TIFF rows first.")
+            return
+        for idx in indices:
+            self.folder_entries[idx]["exposure"] = value
+            self.folder_entries[idx]["exposure_source"] = "manual"
+            self._update_tree_row(idx)
+        self.status_var.set(f"Set exposure={value:g} s for {len(indices)} selected frame(s).")
+
+    def set_all_exposure(self):
+        try:
+            value = self._manual_exposure_seconds()
+        except Exception as exc:
+            messagebox.showerror("Exposure", str(exc))
+            return
+        for idx, entry in enumerate(self.folder_entries):
+            entry["exposure"] = value
+            entry["exposure_source"] = "manual"
+            self._update_tree_row(idx)
+        self.status_var.set(f"Set exposure={value:g} s for all {len(self.folder_entries)} frame(s).")
+
+    def clear_selected_manual_exposure(self):
+        indices = self._selected_tree_indices()
+        if not indices:
+            messagebox.showinfo("Exposure", "Select one or more TIFF rows first.")
+            return
+        changed = 0
+        for idx in indices:
+            entry = self.folder_entries[idx]
+            source = str(entry.get("exposure_source") or "")
+            if source.lower().startswith("manual") or source.upper().startswith("CSV") or source.lower() == "session":
+                entry["exposure"] = None
+                entry["exposure_source"] = None
+                self._apply_exposure_policy_to_entry(entry, preserve_manual=False)
+                self._update_tree_row(idx)
+                changed += 1
+        self.status_var.set(f"Cleared manual/CSV/session exposure on {changed} selected frame(s).")
+
+    def redetect_selected_exposure(self):
+        indices = self._selected_tree_indices()
+        if not indices:
+            messagebox.showinfo("Exposure", "Select one or more TIFF rows first.")
+            return
+        for idx in indices:
+            entry = self.folder_entries[idx]
+            try:
+                entry["exposure_info"] = inspect_tiff_exposure_info(entry["path"])
+            except Exception:
+                pass
+            # Re-detect deliberately clears any manual value on these rows.
+            entry["exposure"] = None
+            entry["exposure_source"] = None
+            self._apply_exposure_policy_to_entry(entry, preserve_manual=False)
+            self._update_tree_row(idx)
+        self.status_var.set(f"Re-detected exposure candidates for {len(indices)} selected frame(s).")
+
+    def use_header_for_selected_exposure(self):
+        indices = self._selected_tree_indices()
+        if not indices:
+            messagebox.showinfo("Exposure", "Select one or more TIFF rows first.")
+            return
+        applied = 0
+        missing = 0
+        for idx in indices:
+            entry = self.folder_entries[idx]
+            info = entry.get("exposure_info") or {}
+            value = info.get("header_exposure_seconds")
+            if value is None:
+                missing += 1
+                continue
+            entry["exposure"] = float(value)
+            entry["exposure_source"] = "manual header: " + (info.get("header_exposure_source") or "header")
+            self._update_tree_row(idx)
+            applied += 1
+        self.status_var.set(
+            f"Used header exposure for {applied} selected frame(s); {missing} had no header exposure."
+        )
+
+    def import_exposure_csv(self):
+        path = filedialog.askopenfilename(
+            title="Import exposure times",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            mapping = {}
+            with open(path, "r", newline="", encoding="utf-8-sig") as handle:
+                reader = csv.DictReader(handle)
+                if not reader.fieldnames:
+                    raise ValueError("CSV has no header row.")
+                normalized = {name.lower().strip(): name for name in reader.fieldnames}
+                file_key = next((normalized[k] for k in ("file", "filename", "path") if k in normalized), None)
+                exp_key = next((normalized[k] for k in ("exposure", "exposure_s", "exposure_seconds", "integration_time") if k in normalized), None)
+                if file_key is None or exp_key is None:
+                    raise ValueError("CSV must contain filename/file and exposure/exposure_seconds columns.")
+                for row in reader:
+                    name = Path(str(row[file_key]).strip()).name
+                    value = float(row[exp_key])
+                    if np.isfinite(value) and value > 0:
+                        mapping[name] = value
+            matched = 0
+            for idx, entry in enumerate(self.folder_entries):
+                if entry["path"].name in mapping:
+                    entry["exposure"] = mapping[entry["path"].name]
+                    entry["exposure_source"] = f"CSV:{Path(path).name}"
+                    self._update_tree_row(idx)
+                    matched += 1
+            self.status_var.set(f"Imported exposure times for {matched} frame(s).")
+        except Exception as exc:
+            messagebox.showerror("Exposure CSV", str(exc))
 
     def included_paths(self):
         return [
@@ -2028,6 +2978,22 @@ class XRDToolkitApp(tk.Tk):
     # ============================================================
 
     def get_stack_settings(self):
+        exposures = {}
+        exposure_sources = {}
+        exposure_candidates = {}
+        for entry in self.folder_entries:
+            keys = [str(entry["path"]), entry["path"].name]
+            try:
+                keys.append(str(entry["path"].resolve()))
+            except Exception:
+                pass
+            for key in keys:
+                exposure_sources[key] = entry.get("exposure_source") or "unknown"
+                exposure_candidates[key] = dict(entry.get("exposure_info") or {})
+            if entry.get("exposure") is not None:
+                value = float(entry["exposure"])
+                for key in keys:
+                    exposures[key] = value
         return StackSettings(
             method=self.stack_method.get(),
             align=self.stack_align.get(),
@@ -2040,6 +3006,12 @@ class XRDToolkitApp(tk.Tk):
             huber_iterations=int(self.stack_huber_iterations.get()),
             noise_weight_floor=float(self.stack_noise_weight_floor.get()),
             chunk_rows=int(self.stack_chunk_rows.get()),
+            normalization_mode=self.stack_normalization_mode.get(),
+            reference_exposure_seconds=float(self.stack_reference_exposure.get()),
+            frame_exposures=exposures,
+            frame_exposure_sources=exposure_sources,
+            frame_exposure_candidates=exposure_candidates,
+            input_correction_state=self.input_correction_state.get(),
             compute_backend=self.compute_backend.get(),
             fft_workers=int(self.fft_workers.get()),
             registration_crop_size=int(self.registration_crop_size.get()),
@@ -2064,6 +3036,56 @@ class XRDToolkitApp(tk.Tk):
             return
 
         settings = self.get_stack_settings()
+
+        if settings.normalization_mode == "exposure":
+            missing = [
+                p.name for p in paths
+                if not any(
+                    key in settings.frame_exposures
+                    for key in (str(p), str(p.resolve()), p.name)
+                )
+            ]
+            if missing:
+                shown = "\n".join(f"• {name}" for name in missing[:12])
+                if len(missing) > 12:
+                    shown += f"\n… and {len(missing)-12} more."
+                messagebox.showerror(
+                    "Missing exposure times",
+                    "Exposure normalization is enabled, but these included frames have no exposure time:\n\n" + shown,
+                )
+                return
+            if float(settings.reference_exposure_seconds) <= 0:
+                messagebox.showerror(
+                    "Exposure normalization",
+                    "Reference exposure must be positive.",
+                )
+                return
+
+            included_set = {str(p) for p in paths}
+            mismatches = [
+                entry for entry in self.folder_entries
+                if str(entry["path"]) in included_set
+                and (entry.get("exposure_info") or {}).get("exposure_mismatch")
+            ]
+            if mismatches:
+                lines = []
+                for entry in mismatches[:10]:
+                    info = entry.get("exposure_info") or {}
+                    lines.append(
+                        f"• {entry['path'].name}: selected {entry.get('exposure'):g} s "
+                        f"({entry.get('exposure_source') or 'unknown'}), "
+                        f"header {info.get('header_exposure_seconds'):g} s"
+                    )
+                if len(mismatches) > 10:
+                    lines.append(f"… and {len(mismatches)-10} more.")
+                proceed = messagebox.askyesno(
+                    "Exposure mismatch warning",
+                    "Filename/manual and detector-header exposure values disagree for "
+                    "one or more included frames:\n\n" + "\n".join(lines) +
+                    "\n\nContinue using the selected exposure values shown in the file table?",
+                )
+                if not proceed:
+                    return
 
         # Validate dimensions before robust stack methods allocate a disk-backed
         # array.  If a thumbnail/processed TIFF is mixed into the folder, offer
@@ -2520,7 +3542,18 @@ class XRDToolkitApp(tk.Tk):
 
         selected_view = self.view_var.get()
 
-        if selected_view == "Stack":
+        if selected_view == "Comparison":
+            if self.comparison_result is None:
+                self.ax.set_title("No comparison has been built.")
+                self.canvas.draw_idle()
+                return
+            image = self.comparison_result.image
+            title = (
+                f"Comparison — {self.comparison_result.mode} — "
+                f"scale B→A {self.comparison_result.scale_b_to_a:.5g}"
+            )
+
+        elif selected_view == "Stack":
             if self.stack_result is None:
                 self.ax.set_title("No stack has been built.")
                 self.canvas.draw_idle()
@@ -2618,6 +3651,7 @@ class XRDToolkitApp(tk.Tk):
                 "Symmetrized",
                 "Asymmetry",
                 "Symmetry contributors",
+                "Comparison",
             }
         ):
             cx = self.center_x.get()
@@ -2652,6 +3686,45 @@ class XRDToolkitApp(tk.Tk):
                 linewidth=0.8,
                 alpha=0.5,
             )
+
+        # Non-destructive ROI / annotation overlays.
+        if self.rois and selected_view not in {"Symmetrized", "Asymmetry", "Symmetry contributors"}:
+            from matplotlib.patches import Circle, Ellipse, Rectangle
+            for roi in self.rois:
+                if not roi.visible:
+                    continue
+                kind = roi.shape_type.lower()
+                if kind == "circle":
+                    radius = float(np.hypot(roi.x1-roi.x0, roi.y1-roi.y0))
+                    patch = Circle((roi.x0, roi.y0), radius, fill=False, linewidth=1.1)
+                    self.ax.add_patch(patch)
+                elif kind == "ellipse":
+                    cx=0.5*(roi.x0+roi.x1); cy=0.5*(roi.y0+roi.y1)
+                    patch=Ellipse((cx,cy), abs(roi.x1-roi.x0), abs(roi.y1-roi.y0), fill=False, linewidth=1.1)
+                    self.ax.add_patch(patch)
+                elif kind == "rectangle":
+                    x=min(roi.x0,roi.x1); y=min(roi.y0,roi.y1)
+                    patch=Rectangle((x,y),abs(roi.x1-roi.x0),abs(roi.y1-roi.y0),fill=False,linewidth=1.1)
+                    self.ax.add_patch(patch)
+                elif kind == "line":
+                    self.ax.plot([roi.x0,roi.x1],[roi.y0,roi.y1],linewidth=1.1)
+                if roi.label:
+                    self.ax.text(roi.x0, roi.y0, roi.label, fontsize=8)
+
+        # Layer-line overlays are analysis annotations in native detector coordinates.
+        if self.layer_line_result is not None and selected_view not in {"Symmetrized", "Asymmetry", "Symmetry contributors", "Comparison"}:
+            length = max(self.raw.shape) if self.raw is not None else max(image.shape)
+            for line in self.layer_line_result.lines:
+                offset = line.measured_offset_px if line.measured_offset_px is not None else line.offset_px
+                xs, ys = fiber_to_detector(
+                    np.array([offset, offset]),
+                    np.array([-length, length]),
+                    self.center_x.get(), self.center_y.get(), self.fiber_angle.get(),
+                )
+                self.ax.plot(xs, ys, linewidth=0.65, alpha=0.75)
+                if abs(offset) < length:
+                    tx, ty = fiber_to_detector(offset, 0.0, self.center_x.get(), self.center_y.get(), self.fiber_angle.get())
+                    self.ax.text(float(tx)+4, float(ty)+4, f"L{line.index}", fontsize=7)
 
         self.fig.tight_layout()
         self.canvas.draw_idle()
@@ -3055,6 +4128,10 @@ class XRDToolkitApp(tk.Tk):
         x = float(event.xdata)
         y = float(event.ydata)
 
+        if self.roi_draw_mode is not None:
+            self.roi_drag_start = (x, y)
+            return
+
         if self.click_mode == "beamstop_center":
             self.beamstop_center_x.set(x)
             self.beamstop_center_y.set(y)
@@ -3074,6 +4151,14 @@ class XRDToolkitApp(tk.Tk):
             self.status_var.set(
                 f"Beam center set to ({x:.1f}, {y:.1f})."
             )
+
+        elif self.click_mode == "layer_anchor":
+            parallel, _perp = detector_to_fiber(
+                x, y, self.center_x.get(), self.center_y.get(), self.fiber_angle.get()
+            )
+            self.layer_line_anchor_offset.set(float(parallel))
+            self.click_mode = None
+            self.status_var.set(f"Layer-line anchor offset set to {float(parallel):.2f} px.")
 
         elif self.click_mode == "fiber_axis":
             self.axis_click_points.append((x, y))
@@ -3099,6 +4184,43 @@ class XRDToolkitApp(tk.Tk):
                 self.status_var.set(
                     f"Fiber-axis angle set to {angle:.2f}°."
                 )
+
+    def _on_image_motion(self, event):
+        if self.roi_draw_mode is None or self.roi_drag_start is None:
+            return
+        if event.inaxes != self.ax or event.xdata is None or event.ydata is None:
+            return
+        # Lightweight status preview; final patch is created on mouse release.
+        x0, y0 = self.roi_drag_start
+        self.status_var.set(
+            f"Drawing {self.roi_draw_mode}: ({x0:.1f},{y0:.1f}) → ({event.xdata:.1f},{event.ydata:.1f})"
+        )
+
+    def _on_image_release(self, event):
+        if self.roi_draw_mode is None or self.roi_drag_start is None:
+            return
+        if event.inaxes != self.ax or event.xdata is None or event.ydata is None:
+            self.roi_drag_start = None
+            return
+        x0, y0 = self.roi_drag_start
+        x1, y1 = float(event.xdata), float(event.ydata)
+        if np.hypot(x1-x0, y1-y0) < 2.0:
+            self.roi_drag_start = None
+            self.status_var.set("ROI was too small; drag farther to create it.")
+            return
+        self.roi_counter += 1
+        roi = ROIShape(
+            roi_id=f"ROI-{self.roi_counter:03d}",
+            shape_type=self.roi_draw_mode,
+            x0=float(x0), y0=float(y0), x1=x1, y1=y1,
+            label=f"ROI-{self.roi_counter:03d}",
+        )
+        self.rois.append(roi)
+        self.roi_drag_start = None
+        self.roi_draw_mode = None
+        self._refresh_roi_list()
+        self.refresh_plot()
+        self.status_var.set(f"Created {roi.shape_type} {roi.roi_id}.")
 
     def use_image_center(self):
         if self.raw is None:
@@ -3301,12 +4423,193 @@ class XRDToolkitApp(tk.Tk):
         )
 
     # ============================================================
+    # ANALYSIS SESSION
+    # ============================================================
+
+    def _session_payload(self):
+        return {
+            "toolkit_version": APP_TITLE,
+            "folder_path": str(self.folder_path) if self.folder_path else None,
+            "files": [
+                {
+                    "path": str(entry["path"]),
+                    "included": bool(entry.get("included", True)),
+                    "exposure": entry.get("exposure"),
+                    "exposure_source": entry.get("exposure_source"),
+                    "exposure_info": entry.get("exposure_info"),
+                }
+                for entry in self.folder_entries
+            ],
+            "stacking": {
+                "method": self.stack_method.get(),
+                "align": self.stack_align.get(),
+                "max_shift": self.stack_max_shift.get(),
+                "normalization_mode": self.stack_normalization_mode.get(),
+                "reference_exposure_seconds": self.stack_reference_exposure.get(),
+                "input_correction_state": self.input_correction_state.get(),
+                "exposure_auto_policy": self.exposure_auto_policy.get(),
+                "sigma_clip_threshold": self.stack_sigma.get(),
+                "sigma_clip_iterations": self.stack_iterations.get(),
+                "trim_fraction": self.stack_trim_fraction.get(),
+                "winsor_fraction": self.stack_winsor_fraction.get(),
+                "huber_delta": self.stack_huber_delta.get(),
+                "huber_iterations": self.stack_huber_iterations.get(),
+            },
+            "fiber_geometry": {
+                "center_x": self.center_x.get(),
+                "center_y": self.center_y.get(),
+                "fiber_angle_deg": self.fiber_angle.get(),
+                "strip_width": self.strip_width.get(),
+            },
+            "contrast": {
+                "display_mode": self.display_mode.get(),
+                "contrast_mode": self.contrast_mode.get(),
+                "percentile_low": self.percentile_low.get(),
+                "percentile_high": self.percentile_high.get(),
+                "tone_curve_points": [list(v) for v in self.tone_curve_points],
+                "tone_curve_monotonic": self.tone_curve_monotonic.get(),
+                "invert_display": self.invert_display.get(),
+            },
+            "layer_lines": {
+                "count": self.layer_line_count.get(),
+                "anchor_offset_px": self.layer_line_anchor_offset.get(),
+                "refine_radius_px": self.layer_line_refine_radius.get(),
+                "inner_perp_px": self.layer_line_inner_perp.get(),
+                "outer_perp_px": self.layer_line_outer_perp.get(),
+                "half_width_px": self.layer_line_half_width.get(),
+                "fit": self.layer_line_result.to_dict() if self.layer_line_result is not None else None,
+            },
+            "rois": [roi.to_dict() for roi in self.rois],
+        }
+
+    def save_analysis_session(self):
+        path = filedialog.asksaveasfilename(
+            title="Save XRD Image Toolkit session",
+            defaultextension=".json",
+            filetypes=[("Toolkit session JSON", "*.json"), ("All files", "*.*")],
+            initialfile=f"{self._safe_current_stem()}_xrd_session.json",
+        )
+        if not path:
+            return
+        try:
+            save_session(path, self._session_payload())
+            self.status_var.set(f"Saved analysis session: {Path(path).name}")
+        except Exception as exc:
+            messagebox.showerror("Session save", str(exc))
+
+    def load_analysis_session(self):
+        path = filedialog.askopenfilename(
+            title="Load XRD Image Toolkit session",
+            filetypes=[("Toolkit session JSON", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            record = load_session(path)
+            stack = record.get("stacking", {})
+            setters = [
+                (self.stack_method, stack.get("method")),
+                (self.stack_align, stack.get("align")),
+                (self.stack_max_shift, stack.get("max_shift")),
+                (self.stack_normalization_mode, stack.get("normalization_mode")),
+                (self.stack_reference_exposure, stack.get("reference_exposure_seconds")),
+                (self.input_correction_state, stack.get("input_correction_state")),
+                (self.exposure_auto_policy, stack.get("exposure_auto_policy")),
+                (self.stack_sigma, stack.get("sigma_clip_threshold")),
+                (self.stack_iterations, stack.get("sigma_clip_iterations")),
+                (self.stack_trim_fraction, stack.get("trim_fraction")),
+                (self.stack_winsor_fraction, stack.get("winsor_fraction")),
+                (self.stack_huber_delta, stack.get("huber_delta")),
+                (self.stack_huber_iterations, stack.get("huber_iterations")),
+            ]
+            fiber = record.get("fiber_geometry", {})
+            setters += [
+                (self.center_x, fiber.get("center_x")),
+                (self.center_y, fiber.get("center_y")),
+                (self.fiber_angle, fiber.get("fiber_angle_deg")),
+                (self.strip_width, fiber.get("strip_width")),
+            ]
+            contrast = record.get("contrast", {})
+            setters += [
+                (self.display_mode, contrast.get("display_mode")),
+                (self.contrast_mode, contrast.get("contrast_mode")),
+                (self.percentile_low, contrast.get("percentile_low")),
+                (self.percentile_high, contrast.get("percentile_high")),
+                (self.tone_curve_monotonic, contrast.get("tone_curve_monotonic")),
+                (self.invert_display, contrast.get("invert_display")),
+            ]
+            layer = record.get("layer_lines", {})
+            setters += [
+                (self.layer_line_count, layer.get("count")),
+                (self.layer_line_anchor_offset, layer.get("anchor_offset_px")),
+                (self.layer_line_refine_radius, layer.get("refine_radius_px")),
+                (self.layer_line_inner_perp, layer.get("inner_perp_px")),
+                (self.layer_line_outer_perp, layer.get("outer_perp_px")),
+                (self.layer_line_half_width, layer.get("half_width_px")),
+            ]
+            for var, value in setters:
+                if value is not None:
+                    var.set(value)
+            if contrast.get("tone_curve_points"):
+                self.tone_curve_points = [tuple(map(float, pair)) for pair in contrast["tone_curve_points"]]
+                self._sync_tone_curve_spec()
+                self._draw_tone_curve()
+
+            self.rois = [ROIShape.from_dict(v) for v in record.get("rois", [])]
+            self.roi_counter = max([int(r.roi_id.split("-")[-1]) for r in self.rois if r.roi_id.split("-")[-1].isdigit()] or [0])
+            self._refresh_roi_list()
+
+            # Restore folder selection/exposure metadata when paths are accessible.
+            files = record.get("files", [])
+            existing = [Path(item["path"]) for item in files if Path(item["path"]).exists()]
+            if existing:
+                self.folder_path = Path(record.get("folder_path")) if record.get("folder_path") else existing[0].parent
+                by_path = {str(Path(item["path"])): item for item in files}
+                self.folder_entries = []
+                for file_path in existing:
+                    entry = self._new_entry(file_path, included=bool(by_path[str(file_path)].get("included", True)))
+                    item = by_path[str(file_path)]
+                    if item.get("exposure_info"):
+                        entry["exposure_info"] = item.get("exposure_info")
+                    if item.get("exposure") is not None:
+                        entry["exposure"] = float(item["exposure"])
+                        entry["exposure_source"] = item.get("exposure_source") or "session"
+                    self.folder_entries.append(entry)
+                valid_shapes = [e["shape"] for e in self.folder_entries if e.get("shape") is not None]
+                if valid_shapes:
+                    from collections import Counter
+                    self.folder_common_shape = Counter(valid_shapes).most_common(1)[0][0]
+                self.folder_label.configure(text=f"Session folder:\n{self.folder_path}\n{len(self.folder_entries)} accessible TIFF(s)")
+                self._rebuild_file_tree()
+                self._load_main_image(existing[0], keep_folder=True)
+            else:
+                self.refresh_plot()
+
+            self.status_var.set(f"Loaded analysis session: {Path(path).name}")
+        except Exception as exc:
+            messagebox.showerror("Session load", str(exc))
+
+    # ============================================================
     # EXPORT
     # ============================================================
 
     def _current_view_image_and_title(self):
         """Return a display-ready version of the currently selected viewer image."""
         selected = self.view_var.get()
+
+        if selected == "Comparison":
+            if self.comparison_result is None:
+                raise ValueError("No comparison has been built.")
+            from .processing import display_transform
+            rendered = display_transform(
+                self.comparison_result.image,
+                self.get_processing_settings(),
+            )
+            title = (
+                f"Comparison — {self.comparison_result.mode} — "
+                f"scale B→A {self.comparison_result.scale_b_to_a:.5g}"
+            )
+            return rendered, title
 
         if selected == "Stack":
             if self.stack_result is None:
@@ -3711,6 +5014,38 @@ class XRDToolkitApp(tk.Tk):
                 ),
                 "input_files": frame_paths,
                 "approximate_ideal_snr_gain": approx_snr,
+                "input_correction_state": (
+                    self.stack_result.settings.input_correction_state
+                    if stack_used else self.input_correction_state.get()
+                ),
+                "frame_normalization_mode": (
+                    self.stack_result.settings.normalization_mode
+                    if stack_used else "none"
+                ),
+                "reference_exposure_seconds": (
+                    self.stack_result.settings.reference_exposure_seconds
+                    if stack_used else None
+                ),
+                "frame_exposures_seconds": (
+                    {stat.filename: stat.exposure_seconds for stat in self.stack_result.frame_stats}
+                    if stack_used else {}
+                ),
+                "frame_exposure_sources": (
+                    {stat.filename: stat.exposure_source for stat in self.stack_result.frame_stats}
+                    if stack_used else {}
+                ),
+                "frame_exposure_candidates": (
+                    {
+                        stat.filename: {
+                            "filename_exposure_seconds": stat.filename_exposure_seconds,
+                            "header_exposure_seconds": stat.header_exposure_seconds,
+                            "header_integration_seconds": stat.header_integration_seconds,
+                            "exposure_mismatch": stat.exposure_mismatch,
+                        }
+                        for stat in self.stack_result.frame_stats
+                    }
+                    if stack_used else {}
+                ),
             },
             "reference_frames": {
                 "dark_file": (
@@ -4154,6 +5489,13 @@ class XRDToolkitApp(tk.Tk):
                     "stack_weight",
                     "shift_y",
                     "shift_x",
+                    "exposure_seconds",
+                    "exposure_source",
+                    "filename_exposure_seconds",
+                    "header_exposure_seconds",
+                    "header_integration_seconds",
+                    "exposure_mismatch",
+                    "normalization_factor",
                 ],
             )
 

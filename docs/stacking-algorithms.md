@@ -45,3 +45,9 @@ Uses an iterative M-estimator: small residuals retain full weight while large re
 For a new dataset, first build a **mean** stack. Then compare it with **sigma-clipped mean**, **min/max rejected mean**, and optionally **Huber mean**. If the robust products only remove isolated detector events while genuine diffraction features remain unchanged, they are reasonable alternatives. If weak spots or layer lines change substantially, inspect the contributing frames rather than automatically choosing the cleaner-looking stack.
 
 Temporal stacks and symmetry/quadrant folding solve different problems. Temporal stacking combines repeated experimental exposures; quadrant folding combines symmetry-related measurements within a pattern. Keep those steps and their metadata separate.
+
+## Mixed exposure times
+
+Version 0.7.1 can normalize each included frame to a common reference exposure before applying any stack estimator. Exposure values can come from explicit filename tokens, manual assignment, CSV import, or a user-confirmed detector header. See `EXPOSURE_HANDLING.md`.
+
+For Poisson-dominated repeated exposures, the **exposure-weighted mean** is useful after exposure normalization because longer integrations generally carry more counting information. Robust estimators remain available when transient detector artefacts are the main concern.
